@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.env
+
+# Uploaded images (dev upload server) — keep the folders, not their contents
+public/uploads/*/*
+!public/uploads/*/.gitkeep

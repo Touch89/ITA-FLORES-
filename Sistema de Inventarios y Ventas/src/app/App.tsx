@@ -4,36 +4,46 @@ import React, {
 import {
   ShoppingCart, Package, ClipboardList, Users, LayoutDashboard,
   Plus, Minus, Trash2, Search, X, ChevronDown, LogOut, Edit2,
-  Eye, EyeOff, Clock, CreditCard, Banknote, Wifi, ArrowLeft,
+  Eye, EyeOff, Clock, CreditCard, Banknote, ArrowLeft,
   Save, Hash, Layers, MapPin, ChevronRight, ChevronLeft, Tag, Check,
   Filter, SlidersHorizontal, AlertCircle, Store, Calendar,
   TrendingUp, Boxes, RotateCcw, Printer, UserCog, ShieldCheck,
-  Warehouse, ChevronUp, Circle, Barcode, ImageIcon,
+  Warehouse, ChevronUp, Circle, Barcode, ImageIcon, ArrowLeftRight, Combine, Percent, Loader2,
 } from "lucide-react";
+import { Toaster, toast } from "sonner";
 
 // ─── TYPES ───────────────────────────────────────────────────────────────────
 
 type UserRole = "admin" | "warehouse" | "seller";
 type Gender = "men" | "women" | "unisex" | "accessories";
-type PaymentMethod = "cash" | "card" | "contactless";
-type View = "pos" | "inventory" | "history" | "users";
+type PaymentMethod = "cash" | "card" | "mixed";
+type View = "pos" | "inventory" | "history" | "users" | "commissions" | "branches";
 
 interface User {
   id: string;
   name: string;
-  email: string;
-  password: string;
+  username: string;
+  // Never sent by the server (see server/db.mjs getFullState) — only present on the client
+  // when actively setting a new password (new user, or a password change in UsersView).
+  password?: string;
   role: UserRole;
   branch: string;
-  commissionType: "percentage" | "fixed";
-  commissionValue: number;
+  commissionMode: "tiers" | "custom";
+  customCommissionPercent: number;
   active: boolean;
   avatar?: string;
 }
 
+interface CommissionTier {
+  id: string;
+  min: number;
+  max: number | null; // null = sin límite superior
+  percent: number;
+}
+
 interface VariantSize {
   size: string;
-  stock: number;
+  stockByBranch: Record<string, number>;
 }
 
 interface ProductVariant {
@@ -73,6 +83,7 @@ interface CartItem {
   model?: string;
   size?: string;
   isCustom?: boolean;
+  returnedQty?: number;
 }
 
 interface Sale {
@@ -85,16 +96,81 @@ interface Sale {
   subtotal: number;
   total: number;
   paymentMethod: PaymentMethod;
-  commissionType: "percentage" | "fixed";
-  commissionRate: number;
-  commissionAmount: number;
+  cashAmount?: number;
+  cardAmount?: number;
+  // Only set for a plain "cash" sale — how much the customer handed over, so the receipt can show
+  // "Efectivo recibido"/"Cambio" the same way the payment modal does live before confirming.
+  cashGiven?: number;
+}
+
+// A frozen per-sale line within a Corte — snapshotted at cut time so a corte's breakdown stays
+// accurate even if the underlying Sale is later edited, returned against, or deleted.
+interface CorteSaleSummary {
+  id: string;
+  branch: string;
+  total: number;
+  paymentMethod: PaymentMethod;
+  itemsLabel: string;
+}
+
+// A "corte de caja" is a repeatable, non-destructive snapshot of a branch's sales for the current
+// day up to the moment it's generated — not a locking/closing operation, so staff can run another
+// one later the same day (e.g. a last-minute sale after an earlier cut) without anything breaking.
+interface Corte {
+  id: string;
+  branch: string;
+  performedAt: string;
+  performedBy: string;
+  salesCount: number;
+  totalRevenue: number;
+  cashTotal: number;
+  cardTotal: number;
+  sales: CorteSaleSummary[];
+  // Snapshotted at cut time (not re-derived later) — same reasoning as `sales` above: editing the
+  // day's fondo or adding a movimiento after this corte was made shouldn't rewrite its history.
+  fondoAmount: number;
+  entradas: number;
+  salidas: number;
+}
+
+// One opening cash float per branch per calendar day ("YYYY-MM-DD"), freely editable all day (no
+// lock) — a corte just snapshots whatever it was at the moment the cut was made, so an edit here
+// never retroactively changes a past corte's printed numbers.
+interface CajaFondo {
+  id: string;
+  branch: string;
+  date: string;
+  amount: number;
+  setBy: string;
+  setAt: string;
+}
+
+// An ad-hoc cash movement against a branch's till — a manual top-up ("in") or a cash expense paid
+// straight out of the drawer ("out", e.g. cleaning supplies) — factored into the corte's expected
+// cash total alongside the fondo and the day's cash sales.
+interface CajaMovimiento {
+  id: string;
+  branch: string;
+  type: "in" | "out";
+  amount: number;
+  concept: string;
+  performedBy: string;
+  performedAt: string;
 }
 
 interface AppState {
   users: User[];
   products: Product[];
   sales: Sale[];
+  commissionTiers: CommissionTier[];
+  branches: string[];
+  branchLogos: Record<string, string>;
+  cortes: Corte[];
+  cajaFondos: CajaFondo[];
+  cajaMovimientos: CajaMovimiento[];
+  logoUrl?: string;
   barcodeCounter: number;
+  saleCounter: number;
 }
 
 // ─── CONSTANTS ────────────────────────────────────────────────────────────────
@@ -104,7 +180,6 @@ const CATEGORIES = [
   "Abrigos","Ropa Interior","Deportiva","Relojes","Joyería","Bolsos",
   "Cinturones","Accesorios",
 ];
-const BRANCHES = ["Sucursal Centro","Sucursal Norte","Sucursal Sur","Sucursal Mall"];
 const GENDERS: { value: Gender; label: string }[] = [
   { value: "men", label: "Hombre" },
   { value: "women", label: "Mujer" },
@@ -138,143 +213,69 @@ const PRESET_COLORS = [
 ];
 
 const STORE = {
-  name: "MODA ÉLITE",
+  name: "ITA FLORES",
   slogan: "Viste con estilo · Vive con clase",
-  address: "Av. Principal #123, Col. Centro",
-  phone: "(55) 1234-5678",
+  location: "Plaza Americana",
+  address: "Hotel Fiesta, Americana, C. 56-A 451-Loc 24 interior, Zona Paseo Montejo, Centro, 97000 Mérida, Yuc.",
+  phone: "999 149 3433",
   email: "ventas@modaelite.com",
 };
 
-// ─── INITIAL DATA ─────────────────────────────────────────────────────────────
-
-const INIT_USERS: User[] = [
-  { id:"u1", name:"Carlos Mendoza", email:"admin@modaelite.com", password:"admin123",
-    role:"admin", branch:"Sucursal Centro", commissionType:"percentage", commissionValue:5, active:true },
-  { id:"u2", name:"Sofía Ramírez", email:"almacen@modaelite.com", password:"almacen123",
-    role:"warehouse", branch:"Sucursal Norte", commissionType:"percentage", commissionValue:3, active:true },
-  { id:"u3", name:"Miguel Torres", email:"vendedor@modaelite.com", password:"vendedor123",
-    role:"seller", branch:"Sucursal Centro", commissionType:"fixed", commissionValue:50, active:true },
-  { id:"u4", name:"Ana García", email:"ana@modaelite.com", password:"ana123",
-    role:"seller", branch:"Sucursal Norte", commissionType:"percentage", commissionValue:4, active:true },
-];
-
-const INIT_PRODUCTS: Product[] = [
-  { id:"p1", sku:"CAM-001", barcode:"7890000001001", name:"Camiseta Slim Fit Premium",
-    description:"Algodón 100% peinado, corte slim moderno", category:"Camisetas", gender:"men", price:299, sizeSystem:"sml" as SizeSystem, images:[],
-    variants:[
-      {id:"v1-blanco", color:"Blanco", colorHex:"#F5F5F0", model:"Slim Fit",   sizes:[{size:"S",stock:15},{size:"M",stock:20},{size:"L",stock:8}]},
-      {id:"v1-negro",  color:"Negro",  colorHex:"#1a1a1a",  model:"Slim Fit",   sizes:[{size:"M",stock:12},{size:"L",stock:6}]},
-      {id:"v1-marino", color:"Azul Marino", colorHex:"#1B3A6B", model:"Regular Fit", sizes:[{size:"M",stock:10},{size:"L",stock:4}]},
-    ], active:true, createdAt:"2025-01-15" },
-  { id:"p2", sku:"VES-001", barcode:"7890000001002", name:"Vestido Floral Verano",
-    description:"Vestido ligero con estampado floral, tela chiffon", category:"Vestidos", gender:"women", price:599, sizeSystem:"sml" as SizeSystem, images:[],
-    variants:[
-      {id:"v2-rosa",   color:"Rosa",       colorHex:"#FF69B4", model:"A-line Floral", sizes:[{size:"XS",stock:6},{size:"S",stock:9},{size:"M",stock:3}]},
-      {id:"v2-menta",  color:"Verde Menta",colorHex:"#80CBC4", model:"A-line Floral", sizes:[{size:"S",stock:5},{size:"M",stock:4}]},
-      {id:"v2-blanco", color:"Blanco",     colorHex:"#F5F5F0", model:"A-line Floral", sizes:[{size:"S",stock:7},{size:"M",stock:2}]},
-    ], active:true, createdAt:"2025-01-20" },
-  { id:"p3", sku:"REL-001", barcode:"7890000001003", name:"Reloj Elegance Classic",
-    description:"Correa de cuero genuino, esfera minimalista chapada", category:"Relojes", gender:"accessories", price:1299, sizeSystem:"unica" as SizeSystem, images:[],
-    variants:[
-      {id:"v3-dorado",   color:"Dorado",   colorHex:"#FFD700", model:"Classic Leather", sizes:[{size:"Única",stock:5}]},
-      {id:"v3-plateado", color:"Plateado", colorHex:"#C0C0C0", model:"Classic Leather", sizes:[{size:"Única",stock:7}]},
-      {id:"v3-negro",    color:"Negro",    colorHex:"#1a1a1a",  model:"Sport",           sizes:[{size:"Única",stock:3}]},
-    ], active:true, createdAt:"2025-02-01" },
-  { id:"p4", sku:"BOL-001", barcode:"7890000001004", name:"Bolso Tote Cuero",
-    description:"Cuero sintético premium con múltiples compartimentos", category:"Bolsos", gender:"accessories", price:899, sizeSystem:"unica" as SizeSystem, images:[],
-    variants:[
-      {id:"v4-negro", color:"Negro", colorHex:"#1a1a1a",  model:"Tote Grande",  sizes:[{size:"Única",stock:8}]},
-      {id:"v4-cafe",  color:"Café",  colorHex:"#795548",  model:"Tote Grande",  sizes:[{size:"Única",stock:5}]},
-      {id:"v4-beige", color:"Beige", colorHex:"#D4B896",  model:"Tote Mediano", sizes:[{size:"Única",stock:10}]},
-    ], active:true, createdAt:"2025-02-05" },
-  { id:"p5", sku:"PAN-001", barcode:"7890000001005", name:"Pantalón Chino Clásico",
-    description:"Algodón stretch de corte recto, cómodo y versátil", category:"Pantalones", gender:"men", price:499, sizeSystem:"numeric" as SizeSystem, images:[],
-    variants:[
-      {id:"v5-beige",  color:"Beige",      colorHex:"#D4B896", model:"Chino Recto", sizes:[{size:"30",stock:12},{size:"32",stock:15},{size:"34",stock:8}]},
-      {id:"v5-marino", color:"Azul Marino",colorHex:"#1B3A6B", model:"Chino Recto", sizes:[{size:"30",stock:6},{size:"32",stock:10}]},
-      {id:"v5-gris",   color:"Gris",       colorHex:"#9E9E9E", model:"Chino Slim",  sizes:[{size:"30",stock:8},{size:"32",stock:5}]},
-    ], active:true, createdAt:"2025-02-10" },
-  { id:"p6", sku:"BLU-001", barcode:"7890000001006", name:"Blusa Seda Drapeada",
-    description:"Seda artificial con caída elegante, varios escotes", category:"Blusas", gender:"women", price:449, sizeSystem:"sml" as SizeSystem, images:[],
-    variants:[
-      {id:"v6-blanco", color:"Blanco", colorHex:"#F5F5F0", model:"V-neck Drapeada",   sizes:[{size:"S",stock:8},{size:"M",stock:4}]},
-      {id:"v6-negro",  color:"Negro",  colorHex:"#1a1a1a",  model:"V-neck Drapeada",   sizes:[{size:"M",stock:6},{size:"L",stock:2}]},
-      {id:"v6-morado", color:"Morado", colorHex:"#9C27B0",  model:"Round Drapeada",    sizes:[{size:"S",stock:4},{size:"M",stock:3}]},
-    ], active:true, createdAt:"2025-02-15" },
-  { id:"p7", sku:"JOY-001", barcode:"7890000001007", name:"Collar Perlas Naturales",
-    description:"Perlas de agua dulce con cierre de plata .925", category:"Joyería", gender:"accessories", price:750, sizeSystem:"unica" as SizeSystem, images:[],
-    variants:[
-      {id:"v7-blanco",   color:"Blanco",   colorHex:"#F5F5F0", model:"Clásico 42cm", sizes:[{size:"Única",stock:6}]},
-      {id:"v7-plateado", color:"Plateado", colorHex:"#C0C0C0", model:"Choker 35cm",  sizes:[{size:"Única",stock:4}]},
-    ], active:true, createdAt:"2025-03-01" },
-];
-
-const INIT_SALES: Sale[] = [
-  { id:"sale-001", date:"2025-07-10T10:30:00", sellerId:"u3", sellerName:"Miguel Torres",
-    branch:"Sucursal Centro",
-    items:[
-      {cartId:"ci1",productId:"p1",variantId:"v1b",name:"Camiseta Slim Fit Premium",price:299,quantity:2,color:"Blanco",model:"Slim Fit",size:"M"},
-      {cartId:"ci2",productId:"p5",variantId:"v5b",name:"Pantalón Chino Clásico",price:499,quantity:1,color:"Beige",model:"Chino Recto",size:"32"},
-    ],
-    subtotal:1097, total:1097, paymentMethod:"card", commissionType:"fixed", commissionRate:50, commissionAmount:50 },
-  { id:"sale-002", date:"2025-07-11T14:15:00", sellerId:"u4", sellerName:"Ana García",
-    branch:"Sucursal Norte",
-    items:[
-      {cartId:"ci3",productId:"p2",variantId:"v2b",name:"Vestido Floral Verano",price:599,quantity:1,color:"Rosa",model:"A-line Floral",size:"S"},
-      {cartId:"ci4",productId:"p4",variantId:"v4c",name:"Bolso Tote Cuero",price:899,quantity:1,color:"Beige",model:"Tote Mediano",size:"Único"},
-    ],
-    subtotal:1498, total:1498, paymentMethod:"cash", commissionType:"percentage", commissionRate:4, commissionAmount:59.92 },
-  { id:"sale-003", date:"2025-07-12T09:00:00", sellerId:"u3", sellerName:"Miguel Torres",
-    branch:"Sucursal Centro",
-    items:[
-      {cartId:"ci5",productId:"p3",variantId:"v3a",name:"Reloj Elegance Classic",price:1299,quantity:1,color:"Dorado",model:"Classic Leather",size:"Único"},
-    ],
-    subtotal:1299, total:1299, paymentMethod:"contactless", commissionType:"fixed", commissionRate:50, commissionAmount:50 },
-  { id:"sale-004", date:"2025-07-12T11:45:00", sellerId:"u4", sellerName:"Ana García",
-    branch:"Sucursal Norte",
-    items:[
-      {cartId:"ci6",productId:"p7",variantId:"v7a",name:"Collar Perlas Naturales",price:750,quantity:1,color:"Blanco",model:"Clásico 42cm",size:"Único"},
-      {cartId:"ci7",isCustom:true,name:"Envolver regalo",price:50,quantity:1},
-    ],
-    subtotal:800, total:800, paymentMethod:"card", commissionType:"percentage", commissionRate:4, commissionAmount:32 },
-];
+// Seed/demo data used to live here as JS constants; it's now exclusively in
+// docker/init/02-seed.sql — MariaDB is the source of truth via GET/PUT /api/state.
 
 // ─── PERSISTENCE ──────────────────────────────────────────────────────────────
+// Business data (users, products, sales, commission tiers, logo/settings) lives in MariaDB,
+// served through the dev-only GET/PUT /api/state middleware (see vite.config.ts + server/db.mjs).
+// The only thing still in localStorage is which user is logged in on this browser — session
+// state, not business data.
 
-const STATE_KEY = "moda_state_v2";
-const AUTH_KEY  = "moda_auth_v2";
+const AUTH_KEY = "moda_auth_v2";
 
-const loadState = (): AppState => {
-  try {
-    const s = localStorage.getItem(STATE_KEY);
-    if (s) {
-      const parsed: AppState = JSON.parse(s);
-      // Migrate old products/users that lack new fields
-      parsed.users = parsed.users.map((u) => ({ avatar: undefined, ...u }));
-      parsed.products = parsed.products.map((p) => {
-        const base = { images: [], sizeSystem: "sml" as SizeSystem, ...p };
-        // Migrate flat size+stock variants to grouped sizes format
-        base.variants = base.variants.map((v: any) => {
-          if (v.sizes) return v; // already new format
-          return { id: v.id, color: v.color, colorHex: v.colorHex, model: v.model, sizes: [{ size: v.size ?? "Único", stock: v.stock ?? 0 }] };
-        });
-        // Merge same color+model variants that ended up separate due to old format
-        const merged: ProductVariant[] = [];
-        for (const v of base.variants as ProductVariant[]) {
-          const existing = merged.find((m) => m.color === v.color && m.model === v.model);
-          if (existing) { existing.sizes.push(...v.sizes); } else { merged.push({ ...v }); }
-        }
-        base.variants = merged;
-        return base;
-      });
-      return parsed;
-    }
-  } catch {}
-  return { users: INIT_USERS, products: INIT_PRODUCTS, sales: INIT_SALES, barcodeCounter: 1008 };
+const loadState = async (): Promise<AppState> => {
+  const res = await fetch("/api/state");
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || "No se pudo cargar la información desde la base de datos");
+  }
+  return res.json();
 };
 
+// PUT /api/state rewrites every table on each call, so two overlapping requests can conflict
+// against each other in MariaDB (observed as "Record has changed since last read" / ER_CHECKREAD)
+// if the caller fires saveState several times in quick succession (e.g. adding a few branches back
+// to back). Serializing so only one PUT is ever in flight — with later calls collapsing into just
+// the most recent state once it's free — avoids that without changing any of the ~30 call sites.
+let saveInFlight: Promise<void> | null = null;
+let pendingSaveState: AppState | null = null;
+
+const performSave = (s: AppState): Promise<void> =>
+  fetch("/api/state", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(s),
+  })
+    .then(async (res) => {
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.error || "Error al guardar en la base de datos");
+      }
+    })
+    .catch((err) => toast.error(err instanceof Error ? err.message : "Error al guardar los cambios"));
+
 const saveState = (s: AppState) => {
-  try { localStorage.setItem(STATE_KEY, JSON.stringify(s)); } catch {}
+  if (saveInFlight) {
+    pendingSaveState = s;
+    return;
+  }
+  saveInFlight = performSave(s).then(() => {
+    saveInFlight = null;
+    if (pendingSaveState) {
+      const next = pendingSaveState;
+      pendingSaveState = null;
+      saveState(next);
+    }
+  });
 };
 
 // ─── CONTEXT ──────────────────────────────────────────────────────────────────
@@ -282,7 +283,7 @@ const saveState = (s: AppState) => {
 interface Ctx {
   state: AppState;
   currentUser: User | null;
-  login: (email: string, pw: string) => boolean;
+  login: (username: string, pw: string) => Promise<boolean>;
   logout: () => void;
   setState: React.Dispatch<React.SetStateAction<AppState>>;
 }
@@ -297,14 +298,40 @@ const fmt = (n: number) =>
 const fmtDate = (d: string) =>
   new Date(d).toLocaleString("es-MX", { day:"2-digit", month:"short", year:"numeric", hour:"2-digit", minute:"2-digit" });
 
+// Local (not UTC) "YYYY-MM-DD" — matches what an <input type="date"> reads/writes, so a sale's
+// timestamp and the picker's value can be compared directly regardless of timezone offset.
+const dateStr = (d: Date) =>
+  `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+
+const todayDateStr = () => dateStr(new Date());
+
 const uid = () => Math.random().toString(36).slice(2) + Date.now().toString(36);
 
-const totalVariantStock = (v: ProductVariant) => (v.sizes ?? []).reduce((s, sz) => s + sz.stock, 0);
-const totalProductStock = (p: Product) => p.variants.reduce((s, v) => s + totalVariantStock(v), 0);
+// Whole-pesos-only numeric text input: strips anything non-digit, then any leading zero that isn't
+// the whole value (so typing over a stray "0" can't produce "0500" instead of "500").
+const digitsOnly = (v: string) => v.replace(/\D/g, "").replace(/^0+(?=\d)/, "");
+
+type UploadCategory = "articulos" | "logos" | "usuarios";
+
+const uploadImage = async (file: File, category: UploadCategory, previousUrl?: string): Promise<string> => {
+  const formData = new FormData();
+  formData.append("file", file);
+  if (previousUrl) formData.append("previousUrl", previousUrl);
+  const res = await fetch(`/api/upload/${category}`, { method: "POST", body: formData });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || "Error al subir la imagen");
+  return data.url as string;
+};
+
+const sizeStockAt = (sz: VariantSize, branch: string) => sz.stockByBranch?.[branch] ?? 0;
+const sizeStockTotal = (sz: VariantSize) => Object.values(sz.stockByBranch ?? {}).reduce((a, b) => a + b, 0);
+const totalVariantStock = (v: ProductVariant, branch?: string) =>
+  (v.sizes ?? []).reduce((s, sz) => s + (branch ? sizeStockAt(sz, branch) : sizeStockTotal(sz)), 0);
+const totalProductStock = (p: Product, branch?: string) => p.variants.reduce((s, v) => s + totalVariantStock(v, branch), 0);
 
 const gLabel = (g: Gender) => ({ men:"Hombre", women:"Mujer", unisex:"Unisex", accessories:"Accesorios" }[g]);
 const rLabel = (r: UserRole) => ({ admin:"Administrador", warehouse:"Jefe Almacén", seller:"Vendedor" }[r]);
-const pLabel = (p: PaymentMethod) => ({ cash:"Efectivo", card:"Tarjeta", contactless:"Contactless" }[p]);
+const pLabel = (p: PaymentMethod) => ({ cash:"Efectivo", card:"Tarjeta", mixed:"Efectivo + Tarjeta" }[p] ?? "—");
 
 const roleBadge = (r: UserRole) => ({
   admin: "bg-rose-500/20 text-rose-400 border border-rose-500/30",
@@ -318,6 +345,26 @@ const genderBadge = (g: Gender) => ({
   unisex: "bg-violet-500/20 text-violet-400",
   accessories: "bg-amber-500/20 text-amber-400",
 }[g]);
+
+const BRANCH_STROKE = "[-webkit-text-stroke:0.6px_black] [paint-order:stroke_fill]";
+
+const BranchLabel = ({ branch, className = "" }: { branch: string; className?: string }) => {
+  if (branch === "Mexicane") {
+    return (
+      <span className={className}>
+        <span className={`text-emerald-500 ${BRANCH_STROKE}`}>Mex</span>
+        <span className={`text-white ${BRANCH_STROKE}`}>ica</span>
+        <span className={`text-red-500 ${BRANCH_STROKE}`}>ne</span>
+      </span>
+    );
+  }
+  const color = {
+    "Ita Flores": "text-amber-400",
+    "Dos corazones": "text-rose-500",
+    "Don Carlos": "text-orange-500",
+  }[branch] ?? "";
+  return <span className={`${color} ${BRANCH_STROKE} ${className}`}>{branch}</span>;
+};
 
 // ─── UI PRIMITIVES ────────────────────────────────────────────────────────────
 
@@ -349,10 +396,11 @@ const Btn = ({
 };
 
 const Input = ({
-  label, value, onChange, placeholder, type = "text", className = "", icon, min, step,
+  label, value, onChange, placeholder, type = "text", className = "", icon, min, step, inputMode, onFocus,
 }: {
   label?: string; value: string | number; onChange: (v: string) => void; placeholder?: string;
   type?: string; className?: string; icon?: React.ReactNode; min?: number; step?: number;
+  inputMode?: React.HTMLAttributes<HTMLInputElement>["inputMode"]; onFocus?: React.FocusEventHandler<HTMLInputElement>;
 }) => (
   <div className={`flex flex-col gap-1.5 ${className}`}>
     {label && <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">{label}</label>}
@@ -362,9 +410,11 @@ const Input = ({
         type={type}
         value={value}
         onChange={(e) => onChange(e.target.value)}
+        onFocus={onFocus}
         placeholder={placeholder}
         min={min}
         step={step}
+        inputMode={inputMode}
         className={`w-full bg-secondary border border-border rounded-lg px-3 py-2.5 text-sm text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-2 focus:ring-primary/40 focus:border-primary/50 transition-all ${icon ? "pl-9" : ""}`}
       />
     </div>
@@ -393,14 +443,14 @@ const Select = ({
 );
 
 const Modal = ({
-  open, onClose, title, children, wide = false,
+  open, onClose, title, children, wide = false, closeOnBackdrop = true,
 }: {
-  open: boolean; onClose: () => void; title: string; children: React.ReactNode; wide?: boolean;
+  open: boolean; onClose: () => void; title: string; children: React.ReactNode; wide?: boolean; closeOnBackdrop?: boolean;
 }) => {
   if (!open) return null;
   return (
     <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4">
-      <div className="absolute inset-0 bg-black/70 backdrop-blur-sm" onClick={onClose} />
+      <div className="absolute inset-0 bg-black/70 backdrop-blur-sm" onClick={closeOnBackdrop ? onClose : undefined} />
       <div className={`relative z-10 bg-card border border-border rounded-t-2xl sm:rounded-2xl w-full ${wide ? "sm:max-w-3xl" : "sm:max-w-lg"} max-h-[92vh] flex flex-col shadow-2xl`}>
         <div className="flex items-center justify-between px-5 py-4 border-b border-border flex-shrink-0">
           <h3 className="font-semibold text-base text-foreground">{title}</h3>
@@ -408,7 +458,7 @@ const Modal = ({
             <X size={18} />
           </button>
         </div>
-        <div className="overflow-y-auto flex-1">{children}</div>
+        <div className="overflow-y-auto scrollbar-visible flex-1">{children}</div>
       </div>
     </div>
   );
@@ -442,17 +492,20 @@ const ImageUpload = ({
   images: string[]; onChange: (imgs: string[]) => void;
 }) => {
   const inputRef = useRef<HTMLInputElement>(null);
+  const [uploading, setUploading] = useState(false);
 
-  const handleFiles = (files: FileList | null) => {
-    if (!files) return;
-    Array.from(files).forEach((file) => {
-      const reader = new FileReader();
-      reader.onload = (e) => {
-        const result = e.target?.result as string;
-        onChange([...images, result]);
-      };
-      reader.readAsDataURL(file);
-    });
+  const handleFiles = async (files: FileList | null) => {
+    if (!files || files.length === 0) return;
+    setUploading(true);
+    try {
+      const urls = await Promise.all(Array.from(files).map((file) => uploadImage(file, "articulos")));
+      onChange([...images, ...urls]);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Error al subir la imagen");
+    } finally {
+      setUploading(false);
+      if (inputRef.current) inputRef.current.value = "";
+    }
   };
 
   return (
@@ -475,11 +528,12 @@ const ImageUpload = ({
         ))}
         <button
           type="button"
+          disabled={uploading}
           onClick={() => inputRef.current?.click()}
-          className="w-20 h-20 rounded-xl border-2 border-dashed border-border hover:border-primary/50 hover:bg-primary/5 flex flex-col items-center justify-center text-muted-foreground hover:text-primary transition-all gap-1 flex-shrink-0"
+          className="w-20 h-20 rounded-xl border-2 border-dashed border-border hover:border-primary/50 hover:bg-primary/5 flex flex-col items-center justify-center text-muted-foreground hover:text-primary transition-all gap-1 flex-shrink-0 disabled:opacity-50 disabled:cursor-wait"
         >
           <ImageIcon size={18} />
-          <span className="text-[10px] font-semibold">Agregar</span>
+          <span className="text-[10px] font-semibold">{uploading ? "Subiendo…" : "Agregar"}</span>
         </button>
       </div>
       <p className="text-xs text-muted-foreground">La primera imagen es la principal. Soporta JPG, PNG y WebP.</p>
@@ -523,18 +577,26 @@ const AvatarUpload = ({
   avatar?: string; name: string; onChange: (img: string | undefined) => void;
 }) => {
   const inputRef = useRef<HTMLInputElement>(null);
+  const [uploading, setUploading] = useState(false);
 
-  const handleFile = (files: FileList | null) => {
+  const handleFile = async (files: FileList | null) => {
     const file = files?.[0];
     if (!file) return;
-    const reader = new FileReader();
-    reader.onload = (e) => onChange(e.target?.result as string);
-    reader.readAsDataURL(file);
+    setUploading(true);
+    try {
+      const url = await uploadImage(file, "usuarios");
+      onChange(url);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Error al subir la foto");
+    } finally {
+      setUploading(false);
+      if (inputRef.current) inputRef.current.value = "";
+    }
   };
 
   return (
     <div className="flex items-center gap-4">
-      <div className="relative group cursor-pointer" onClick={() => inputRef.current?.click()}>
+      <div className="relative group cursor-pointer" onClick={() => !uploading && inputRef.current?.click()}>
         <div className="w-20 h-20 rounded-full overflow-hidden border-2 border-border bg-secondary flex items-center justify-center">
           {avatar ? (
             <img src={avatar} alt={name} className="w-full h-full object-cover" />
@@ -549,8 +611,8 @@ const AvatarUpload = ({
         </div>
       </div>
       <div className="flex flex-col gap-2">
-        <Btn size="sm" variant="outline" onClick={() => inputRef.current?.click()}>
-          <ImageIcon size={13} /> {avatar ? "Cambiar foto" : "Subir foto"}
+        <Btn size="sm" variant="outline" disabled={uploading} onClick={() => inputRef.current?.click()}>
+          <ImageIcon size={13} /> {uploading ? "Subiendo…" : avatar ? "Cambiar foto" : "Subir foto"}
         </Btn>
         {avatar && (
           <Btn size="sm" variant="danger" onClick={() => onChange(undefined)}>
@@ -571,8 +633,9 @@ const ProductDetailModal = ({
 }: {
   product: Product; onClose: () => void; onAddToCart?: (p: Product) => void;
 }) => {
+  const { state } = useApp();
   const [imgIdx, setImgIdx] = useState(0);
-  const totalStock = product.variants.reduce((s, v) => s + v.stock, 0);
+  const totalStock = totalProductStock(product);
   const colors = [...new Set(product.variants.map((v) => v.color))];
 
   useEffect(() => { setImgIdx(0); }, [product.id]);
@@ -669,7 +732,7 @@ const ProductDetailModal = ({
             <div className="flex gap-2 flex-wrap">
               {colors.map((color) => {
                 const hex = product.variants.find((v) => v.color === color)?.colorHex ?? "#888";
-                const stock = product.variants.filter((v) => v.color === color).reduce((s, v) => s + v.stock, 0);
+                const stock = product.variants.filter((v) => v.color === color).reduce((s, v) => s + totalVariantStock(v), 0);
                 return (
                   <div key={color} className="flex items-center gap-2 bg-secondary rounded-lg px-2.5 py-1.5">
                     <span className="w-3.5 h-3.5 rounded-full border border-white/20 flex-shrink-0" style={{ background: hex }} />
@@ -681,15 +744,34 @@ const ProductDetailModal = ({
             </div>
           </div>
 
-          {/* Variants */}
+          {/* Variants + per-branch/size stock breakdown */}
           <div>
-            <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-2">Variantes y stock</p>
-            <div className="bg-secondary rounded-xl overflow-hidden border border-border">
-              {product.variants.map((v, i) => (
-                <div key={v.id} className={`flex items-center gap-3 px-3 py-2.5 ${i < product.variants.length - 1 ? "border-b border-border/50" : ""}`}>
-                  <span className="w-3.5 h-3.5 rounded-full flex-shrink-0 border border-white/10" style={{ background: v.colorHex }} />
-                  <span className="text-xs text-foreground flex-1">{v.color} · {v.model}{v.size !== "Único" ? ` · ${v.size}` : ""}</span>
-                  <StockBadge stock={v.stock} />
+            <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-2">Variantes, tallas y sucursales</p>
+            <div className="bg-secondary rounded-xl overflow-hidden border border-border divide-y divide-border/50">
+              {product.variants.map((v) => (
+                <div key={v.id} className="px-3 py-2.5">
+                  <div className="flex items-center gap-2 mb-1.5">
+                    <span className="w-3.5 h-3.5 rounded-full flex-shrink-0 border border-white/10" style={{ background: v.colorHex }} />
+                    <span className="text-xs font-semibold text-foreground flex-1">{v.color} · {v.model}</span>
+                    <StockBadge stock={totalVariantStock(v)} />
+                  </div>
+                  <div className="pl-5 flex flex-col gap-1">
+                    {v.sizes.map((sz) => {
+                      const branchEntries = state.branches.map((b) => ({ b, qty: sizeStockAt(sz, b) })).filter((e) => e.qty > 0);
+                      return (
+                        <div key={sz.size} className="flex items-center gap-2 text-xs flex-wrap">
+                          <span className="font-mono font-bold text-muted-foreground w-8 flex-shrink-0 uppercase">{sz.size}</span>
+                          {branchEntries.length === 0 ? (
+                            <span className="text-red-400">Sin stock en ninguna sucursal</span>
+                          ) : branchEntries.map(({ b, qty }) => (
+                            <span key={b} className="bg-background border border-border rounded-full px-2 py-0.5 text-[10px] font-semibold text-muted-foreground">
+                              {b.replace("Sucursal ", "")}: {qty}
+                            </span>
+                          ))}
+                        </div>
+                      );
+                    })}
+                  </div>
                 </div>
               ))}
             </div>
@@ -713,19 +795,27 @@ const ProductDetailModal = ({
 
 const LoginView = ({ onLogin }: { onLogin: (u: User) => void }) => {
   const { state, login } = useApp();
-  const [email, setEmail] = useState("");
+  const [username, setUsername] = useState("");
   const [pw, setPw] = useState("");
   const [showPw, setShowPw] = useState(false);
   const [error, setError] = useState("");
+  const [loggingIn, setLoggingIn] = useState(false);
 
-  const handle = (e: React.FormEvent) => {
+  const handle = async (e: React.FormEvent) => {
     e.preventDefault();
     setError("");
-    if (login(email, pw)) {
-      const u = state.users.find((u) => u.email === email && u.active)!;
-      onLogin(u);
-    } else {
-      setError("Credenciales incorrectas o cuenta inactiva.");
+    setLoggingIn(true);
+    try {
+      if (await login(username, pw)) {
+        const u = state.users.find((u) => u.username === username && u.active)!;
+        onLogin(u);
+      } else {
+        setError("Credenciales incorrectas o cuenta inactiva.");
+      }
+    } catch {
+      setError("No se pudo conectar con el servidor. Intenta de nuevo.");
+    } finally {
+      setLoggingIn(false);
     }
   };
 
@@ -733,8 +823,12 @@ const LoginView = ({ onLogin }: { onLogin: (u: User) => void }) => {
     <div className="min-h-screen bg-background flex items-center justify-center p-4">
       <div className="w-full max-w-sm">
         <div className="text-center mb-8">
-          <div className="inline-flex items-center justify-center w-16 h-16 rounded-2xl bg-primary/10 border border-primary/20 mb-4">
-            <Store size={32} className="text-primary" />
+          <div className="inline-flex items-center justify-center w-16 h-16 rounded-2xl bg-primary/10 border border-primary/20 mb-4 overflow-hidden">
+            {state.logoUrl ? (
+              <img src={state.logoUrl} alt={STORE.name} className="w-full h-full object-cover object-[85%_50%]" />
+            ) : (
+              <Store size={32} className="text-primary" />
+            )}
           </div>
           <h1 className="text-2xl font-bold text-foreground">{STORE.name}</h1>
           <p className="text-sm text-muted-foreground mt-1">{STORE.slogan}</p>
@@ -742,7 +836,7 @@ const LoginView = ({ onLogin }: { onLogin: (u: User) => void }) => {
         <div className="bg-card border border-border rounded-2xl p-6 shadow-xl shadow-black/30">
           <h2 className="text-lg font-semibold mb-5">Iniciar sesión</h2>
           <form onSubmit={handle} className="flex flex-col gap-4">
-            <Input label="Correo electrónico" value={email} onChange={setEmail} placeholder="usuario@modaelite.com" type="email" icon={<UserCog size={15} />} />
+            <Input label="Usuario" value={username} onChange={setUsername} placeholder="usuario" icon={<UserCog size={15} />} />
             <div className="flex flex-col gap-1.5">
               <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Contraseña</label>
               <div className="relative">
@@ -763,19 +857,19 @@ const LoginView = ({ onLogin }: { onLogin: (u: User) => void }) => {
                 <AlertCircle size={15} /> {error}
               </div>
             )}
-            <Btn type="submit" size="lg" className="mt-1 w-full">Entrar</Btn>
+            <Btn type="submit" size="lg" disabled={loggingIn} className="mt-1 w-full">{loggingIn ? "Entrando…" : "Entrar"}</Btn>
           </form>
           <div className="mt-5 pt-4 border-t border-border">
             <p className="text-xs text-muted-foreground text-center mb-3">Cuentas de demostración:</p>
             <div className="flex flex-col gap-2">
               {[
-                { email:"admin@modaelite.com", pw:"admin123", role:"Administrador" },
-                { email:"almacen@modaelite.com", pw:"almacen123", role:"Jefe Almacén" },
-                { email:"vendedor@modaelite.com", pw:"vendedor123", role:"Vendedor" },
+                { username:"admin", pw:"admin123", role:"Administrador" },
+                { username:"almacen", pw:"almacen123", role:"Jefe Almacén" },
+                { username:"vendedor", pw:"vendedor123", role:"Vendedor" },
               ].map((d) => (
-                <button key={d.email} onClick={() => { setEmail(d.email); setPw(d.pw); }} className="text-left text-xs bg-secondary hover:bg-accent border border-border rounded-lg px-3 py-2 transition-colors">
+                <button key={d.username} onClick={() => { setUsername(d.username); setPw(d.pw); }} className="text-left text-xs bg-secondary hover:bg-accent border border-border rounded-lg px-3 py-2 transition-colors">
                   <span className="font-semibold text-foreground">{d.role}</span>
-                  <span className="text-muted-foreground ml-2">{d.email}</span>
+                  <span className="text-muted-foreground ml-2">{d.username}</span>
                 </button>
               ))}
             </div>
@@ -790,9 +884,11 @@ const LoginView = ({ onLogin }: { onLogin: (u: User) => void }) => {
 
 const NAV_ITEMS: { view: View; label: string; icon: React.ElementType; roles: UserRole[] }[] = [
   { view:"pos",       label:"Venta",      icon:ShoppingCart,    roles:["admin","warehouse","seller"] },
-  { view:"inventory", label:"Inventario", icon:Layers,          roles:["admin","warehouse"] },
+  { view:"inventory", label:"Inventario", icon:Layers,          roles:["admin","warehouse","seller"] },
   { view:"history",   label:"Historial",  icon:ClipboardList,   roles:["admin","warehouse","seller"] },
+  { view:"commissions", label:"Comisiones", icon:Percent,       roles:["admin"] },
   { view:"users",     label:"Usuarios",   icon:Users,           roles:["admin"] },
+  { view:"branches",  label:"Sucursales", icon:Warehouse,       roles:["admin"] },
 ];
 
 const BottomNav = ({ view, setView, role }: { view: View; setView: (v: View) => void; role: UserRole }) => {
@@ -821,24 +917,58 @@ const BottomNav = ({ view, setView, role }: { view: View; setView: (v: View) => 
   );
 };
 
-const SideNav = ({ view, setView, role, user, onLogout }: {
+const SideNav = ({ view, setView, role, user, onLogout, logoUrl, onChangeLogo }: {
   view: View; setView: (v: View) => void; role: UserRole; user: User; onLogout: () => void;
+  logoUrl?: string; onChangeLogo?: (url: string | undefined) => void;
 }) => {
   const items = NAV_ITEMS.filter((n) => n.roles.includes(role));
+  const logoInputRef = useRef<HTMLInputElement>(null);
+  const [uploadingLogo, setUploadingLogo] = useState(false);
+
+  const handleLogoFile = async (files: FileList | null) => {
+    const file = files?.[0];
+    if (!file || !onChangeLogo) return;
+    setUploadingLogo(true);
+    try {
+      onChangeLogo(await uploadImage(file, "logos", logoUrl));
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Error al subir el logo");
+    } finally {
+      setUploadingLogo(false);
+      if (logoInputRef.current) logoInputRef.current.value = "";
+    }
+  };
+
   return (
-    <aside className="hidden lg:flex flex-col w-56 min-h-screen bg-sidebar border-r border-sidebar-border fixed left-0 top-0 z-40">
-      <div className="p-5 border-b border-sidebar-border">
+    <aside className="hidden lg:flex flex-col w-56 h-screen bg-sidebar border-r border-sidebar-border fixed left-0 top-0 z-40">
+      <div className="p-5 border-b border-sidebar-border flex-shrink-0">
         <div className="flex items-center gap-3">
-          <div className="w-9 h-9 rounded-xl bg-primary/10 border border-primary/20 flex items-center justify-center flex-shrink-0">
-            <Store size={18} className="text-primary" />
+          <div
+            className={`relative w-9 h-9 rounded-xl bg-primary/10 border border-primary/20 flex items-center justify-center flex-shrink-0 overflow-hidden group ${onChangeLogo ? "cursor-pointer" : ""}`}
+            onClick={() => onChangeLogo && !uploadingLogo && logoInputRef.current?.click()}
+            title={onChangeLogo ? "Cambiar logo" : undefined}
+          >
+            {logoUrl ? (
+              <img src={logoUrl} alt={STORE.name} className="w-full h-full object-cover object-[85%_50%]" />
+            ) : (
+              <Store size={18} className="text-primary" />
+            )}
+            {onChangeLogo && (
+              <div className="absolute inset-0 bg-black/50 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
+                <ImageIcon size={14} className="text-white" />
+              </div>
+            )}
           </div>
           <div className="min-w-0">
             <p className="font-bold text-sm text-foreground leading-tight">{STORE.name}</p>
-            <p className="text-xs text-muted-foreground truncate">{user.branch}</p>
+            <p className="text-xs text-muted-foreground truncate"><BranchLabel branch={user.branch} /></p>
           </div>
         </div>
+        {onChangeLogo && (
+          <input ref={logoInputRef} type="file" accept="image/*" className="hidden" onChange={(e) => handleLogoFile(e.target.files)} />
+        )}
       </div>
-      <nav className="flex-1 p-3 flex flex-col gap-1">
+      <nav className="flex-1 overflow-y-auto scrollbar-visible p-3 flex flex-col gap-1">
         {items.map((item) => {
           const active = view === item.view;
           return (
@@ -855,7 +985,7 @@ const SideNav = ({ view, setView, role, user, onLogout }: {
           );
         })}
       </nav>
-      <div className="p-3 border-t border-sidebar-border">
+      <div className="p-3 border-t border-sidebar-border flex-shrink-0">
         <div className="flex items-center gap-3 px-2 py-2 mb-1">
           <Avatar user={user} size="sm" />
           <div className="min-w-0 flex-1">
@@ -873,6 +1003,24 @@ const SideNav = ({ view, setView, role, user, onLogout }: {
 
 // ─── RECEIPT ──────────────────────────────────────────────────────────────────
 
+// Printed tickets open in a bare popup window with none of the app's stylesheet loaded, so Tailwind
+// classes on the printable content silently do nothing there (only affects on-screen rendering) —
+// these plain inline styles are what actually reach the printed page via .innerHTML, and happen to
+// double as the on-screen look too, which is fine since a "ticket" should read like paper either way.
+const tk: Record<string, React.CSSProperties> = {
+  wrap: { fontFamily: "'Courier New', monospace", fontSize: 12, color: "#000", lineHeight: 1.6 },
+  center: { textAlign: "center" },
+  bold: { fontWeight: 700 },
+  semibold: { fontWeight: 600 },
+  muted: { color: "#666" },
+  row: { display: "flex", justifyContent: "space-between" },
+  hr: { borderTop: "1px dashed #000", margin: "10px 0" },
+  header: { fontSize: 16, fontWeight: 700, letterSpacing: "0.1em", textTransform: "uppercase" },
+  section: { fontSize: 11, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 6 },
+  small: { fontSize: 10 },
+  base: { fontSize: 14 },
+};
+
 const ReceiptModal = ({ sale, onClose }: { sale: Sale; onClose: () => void }) => {
   const printRef = useRef<HTMLDivElement>(null);
 
@@ -881,16 +1029,8 @@ const ReceiptModal = ({ sale, onClose }: { sale: Sale; onClose: () => void }) =>
     if (!w || !printRef.current) return;
     w.document.write(`
       <!DOCTYPE html><html><head>
-      <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: 'Courier New', monospace; font-size: 11px; background: white; color: #000; padding: 8px; width: 280px; }
-        .center { text-align: center; }
-        .bold { font-weight: bold; }
-        .line { border-top: 1px dashed #000; margin: 6px 0; }
-        .row { display: flex; justify-content: space-between; margin: 2px 0; }
-        .large { font-size: 14px; font-weight: bold; }
-        .title { font-size: 16px; font-weight: bold; letter-spacing: 2px; }
-      </style></head><body>${printRef.current.innerHTML}</body></html>`);
+      <style>* { margin: 0; padding: 0; box-sizing: border-box; } body { background: #fff; padding: 10px; width: 300px; }</style>
+      </head><body>${printRef.current.innerHTML}</body></html>`);
     w.document.close();
     w.focus();
     w.print();
@@ -900,66 +1040,90 @@ const ReceiptModal = ({ sale, onClose }: { sale: Sale; onClose: () => void }) =>
   return (
     <Modal open title="Ticket de Venta" onClose={onClose}>
       <div className="p-5">
-        <div ref={printRef} className="font-mono text-xs text-foreground leading-relaxed">
-          <div className="text-center mb-3">
-            <p className="font-bold text-base tracking-widest">{STORE.name}</p>
-            <p className="text-muted-foreground text-xs">{STORE.slogan}</p>
-            <p className="text-muted-foreground text-xs mt-1">{STORE.address}</p>
-            <p className="text-muted-foreground text-xs">{STORE.phone}</p>
+        <div ref={printRef} style={tk.wrap}>
+          <div style={{ ...tk.center, marginBottom: 12 }}>
+            <p style={tk.header}>{sale.branch}</p>
+            {sale.branch !== "Ita Flores" && <p style={tk.muted}>por Ita Flores</p>}
+            <p style={{ ...tk.muted, marginTop: 4 }}>{STORE.location}</p>
+            <p style={tk.muted}>{STORE.address}</p>
+            <p style={tk.muted}>{STORE.phone}</p>
           </div>
-          <div className="border-t border-dashed border-border my-3" />
-          <div className="flex justify-between text-xs mb-1">
-            <span className="text-muted-foreground">Folio:</span>
-            <span className="font-mono font-semibold">{sale.id.toUpperCase()}</span>
+          <div style={tk.hr} />
+          <div style={{ ...tk.row, marginBottom: 4 }}>
+            <span style={tk.muted}>Folio:</span>
+            <span style={tk.semibold}>{sale.id.toUpperCase()}</span>
           </div>
-          <div className="flex justify-between text-xs mb-1">
-            <span className="text-muted-foreground">Fecha:</span>
+          <div style={{ ...tk.row, marginBottom: 4 }}>
+            <span style={tk.muted}>Fecha:</span>
             <span>{fmtDate(sale.date)}</span>
           </div>
-          <div className="flex justify-between text-xs mb-1">
-            <span className="text-muted-foreground">Vendedor:</span>
+          <div style={{ ...tk.row, marginBottom: 4 }}>
+            <span style={tk.muted}>Vendedor:</span>
             <span>{sale.sellerName}</span>
           </div>
-          <div className="flex justify-between text-xs mb-1">
-            <span className="text-muted-foreground">Sucursal:</span>
+          <div style={{ ...tk.row, marginBottom: 4 }}>
+            <span style={tk.muted}>Sucursal:</span>
             <span>{sale.branch}</span>
           </div>
-          <div className="border-t border-dashed border-border my-3" />
-          <p className="text-xs font-semibold mb-2 text-muted-foreground uppercase tracking-wider">Artículos</p>
+          <div style={tk.hr} />
+          <p style={tk.section}>Artículos</p>
           {sale.items.map((item) => (
-            <div key={item.cartId} className="mb-2">
-              <div className="flex justify-between">
-                <span className="font-semibold text-xs flex-1 pr-2 leading-tight">{item.name}</span>
-                <span className="font-semibold text-xs">{fmt(item.price * item.quantity)}</span>
+            <div key={item.cartId} style={{ marginBottom: 8 }}>
+              <div style={tk.row}>
+                <span style={{ ...tk.semibold, flex: 1, paddingRight: 8 }}>{item.name}</span>
+                <span style={tk.semibold}>{fmt(item.price * item.quantity)}</span>
               </div>
-              <div className="flex justify-between text-muted-foreground text-xs">
+              <div style={{ ...tk.row, ...tk.muted }}>
                 <span>{item.quantity} × {fmt(item.price)}{item.color ? ` · ${item.color}` : ""}{item.size && item.size !== "Único" ? ` / ${item.size}` : ""}</span>
               </div>
             </div>
           ))}
-          <div className="border-t border-dashed border-border my-3" />
-          <div className="flex justify-between mb-1 text-sm">
-            <span className="text-muted-foreground">Subtotal</span>
+          <div style={tk.hr} />
+          <div style={{ ...tk.row, marginBottom: 4, fontSize: 13 }}>
+            <span style={tk.muted}>Subtotal</span>
             <span>{fmt(sale.subtotal)}</span>
           </div>
-          <div className="flex justify-between font-bold text-base mt-2">
+          <div style={{ ...tk.row, ...tk.bold, ...tk.base, marginTop: 8 }}>
             <span>TOTAL</span>
-            <span className="text-primary">{fmt(sale.total)}</span>
+            <span>{fmt(sale.total)}</span>
           </div>
-          <div className="flex justify-between mt-2 text-xs">
-            <span className="text-muted-foreground">Pago</span>
-            <span className="font-semibold">{pLabel(sale.paymentMethod)}</span>
+          <div style={{ ...tk.row, marginTop: 8 }}>
+            <span style={tk.muted}>Pago</span>
+            <span style={tk.semibold}>{pLabel(sale.paymentMethod)}</span>
           </div>
-          <div className="border-t border-dashed border-border my-3" />
-          <div className="text-center text-xs text-muted-foreground">
+          {sale.paymentMethod === "mixed" && (
+            <>
+              <div style={tk.row}>
+                <span style={tk.muted}>· Efectivo</span>
+                <span>{fmt(sale.cashAmount ?? 0)}</span>
+              </div>
+              <div style={tk.row}>
+                <span style={tk.muted}>· Tarjeta</span>
+                <span>{fmt(sale.cardAmount ?? 0)}</span>
+              </div>
+            </>
+          )}
+          {sale.paymentMethod === "cash" && !!sale.cashGiven && (
+            <>
+              <div style={tk.row}>
+                <span style={tk.muted}>Efectivo recibido</span>
+                <span>{fmt(sale.cashGiven)}</span>
+              </div>
+              <div style={tk.row}>
+                <span style={tk.muted}>Cambio</span>
+                <span style={tk.semibold}>{fmt(sale.cashGiven - sale.total)}</span>
+              </div>
+            </>
+          )}
+          <div style={tk.hr} />
+          <div style={{ ...tk.center, ...tk.muted }}>
             <p>¡Gracias por su compra!</p>
-            <p className="mt-1">{STORE.email}</p>
-            <div className="flex justify-center gap-0.5 mt-3">
+            <div style={{ display: "flex", justifyContent: "center", gap: 2, marginTop: 12 }}>
               {Array.from({ length: 36 }).map((_, i) => (
                 <div key={i} style={{ width: i % 3 === 0 ? 3 : 1.5, height: 28, background: "#000", opacity: Math.random() > 0.3 ? 1 : 0 }} />
               ))}
             </div>
-            <p className="mt-1 font-mono text-xs">{sale.id.toUpperCase()}</p>
+            <p style={{ marginTop: 4 }}>{sale.id.toUpperCase()}</p>
           </div>
         </div>
         <div className="flex gap-3 mt-5">
@@ -1000,6 +1164,7 @@ const POSView = ({ user }: { user: User }) => {
   // Payment
   const [payMethod, setPayMethod] = useState<PaymentMethod>("cash");
   const [cashGiven, setCashGiven] = useState("");
+  const [mixedCash, setMixedCash] = useState("");
 
   const filtered = useMemo(() => {
     let list = state.products.filter((p) => p.active);
@@ -1093,12 +1258,9 @@ const POSView = ({ user }: { user: User }) => {
   };
 
   const confirmSale = () => {
-    const commAmt = user.commissionType === "percentage"
-      ? subtotal * (user.commissionValue / 100)
-      : user.commissionValue;
-
+    const nextCounter = state.saleCounter + 1;
     const sale: Sale = {
-      id: `sale-${Date.now()}`,
+      id: String(nextCounter).padStart(4, "0"),
       date: new Date().toISOString(),
       sellerId: user.id,
       sellerName: user.name,
@@ -1107,28 +1269,26 @@ const POSView = ({ user }: { user: User }) => {
       subtotal,
       total: subtotal,
       paymentMethod: payMethod,
-      commissionType: user.commissionType,
-      commissionRate: user.commissionValue,
-      commissionAmount: commAmt,
+      ...(payMethod === "mixed" ? { cashAmount: mixedCashAmount, cardAmount: mixedCardAmount } : {}),
+      ...(payMethod === "cash" ? { cashGiven: parseInt(cashGiven || "0", 10) } : {}),
     };
 
-    // Reduce stock in new grouped sizes model
+    // Reduce stock at the seller's branch only (per variant + size)
     const updatedProducts = state.products.map((p) => ({
       ...p,
-      variants: p.variants.map((v) => {
-        const ci = cart.find((c) => c.variantId === v.id);
-        if (!ci) return v;
-        return {
-          ...v,
-          sizes: v.sizes.map((sz) =>
-            sz.size === ci.size ? { ...sz, stock: Math.max(0, sz.stock - ci.quantity) } : sz
-          ),
-        };
-      }),
+      variants: p.variants.map((v) => ({
+        ...v,
+        sizes: v.sizes.map((sz) => {
+          const ci = cart.find((c) => c.variantId === v.id && c.size === sz.size);
+          if (!ci) return sz;
+          const current = sizeStockAt(sz, user.branch);
+          return { ...sz, stockByBranch: { ...sz.stockByBranch, [user.branch]: Math.max(0, current - ci.quantity) } };
+        }),
+      })),
     }));
 
     setState((s) => {
-      const ns = { ...s, products: updatedProducts, sales: [sale, ...s.sales] };
+      const ns = { ...s, products: updatedProducts, sales: [sale, ...s.sales], saleCounter: nextCounter };
       saveState(ns);
       return ns;
     });
@@ -1136,9 +1296,13 @@ const POSView = ({ user }: { user: User }) => {
     setCart([]);
     setPayModal(false);
     setTab("search");
+    setCashGiven("");
+    setMixedCash("");
   };
 
-  const change = payMethod === "cash" && cashGiven ? parseFloat(cashGiven) - subtotal : 0;
+  const change = payMethod === "cash" ? parseInt(cashGiven || "0", 10) - subtotal : 0;
+  const mixedCashAmount = Math.min(subtotal, Math.max(0, parseFloat(mixedCash) || 0));
+  const mixedCardAmount = subtotal - mixedCashAmount;
 
   return (
     <div className="flex flex-col h-full">
@@ -1176,7 +1340,7 @@ const POSView = ({ user }: { user: User }) => {
             </div>
           </div>
 
-          <div className="flex-1 overflow-y-auto px-4 pb-4 grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-2 xl:grid-cols-3 gap-3 content-start">
+          <div className="flex-1 overflow-y-auto scrollbar-visible px-4 pb-4 grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-2 xl:grid-cols-3 gap-3 content-start">
             {/* Custom item card */}
             <button
               onClick={() => setCustomModal(true)}
@@ -1187,13 +1351,13 @@ const POSView = ({ user }: { user: User }) => {
             </button>
 
             {filtered.map((p) => {
-              const totalStock = totalProductStock(p);
+              const totalStock = totalProductStock(p, user.branch);
               return (
-                <div key={p.id} className="bg-card border border-border rounded-xl overflow-hidden hover:border-primary/40 transition-all flex flex-col group">
+                <div key={p.id} className="bg-card border border-border rounded-xl hover:border-primary/40 transition-all flex flex-col group">
                   {/* Image area → opens detail */}
                   <button
                     onClick={() => setDetailProduct(p)}
-                    className="relative h-32 bg-secondary/40 flex-shrink-0 overflow-hidden"
+                    className="relative aspect-[4/5] bg-secondary/40 flex-shrink-0 overflow-hidden rounded-t-xl"
                   >
                     {p.images?.[0] ? (
                       <img
@@ -1222,7 +1386,7 @@ const POSView = ({ user }: { user: User }) => {
                   {/* Info area → opens variant selector */}
                   <button
                     onClick={() => openVariant(p)}
-                    className="p-3 text-left flex flex-col gap-1.5 flex-1 hover:bg-accent/20 transition-colors active:scale-95"
+                    className="p-3 text-left flex flex-col gap-1.5 flex-1 hover:bg-accent/20 transition-colors active:scale-95 rounded-b-xl"
                   >
                     <p className="text-sm font-semibold text-foreground leading-tight line-clamp-2">{p.name}</p>
                     <p className="text-xs text-muted-foreground">{p.category}</p>
@@ -1260,7 +1424,7 @@ const POSView = ({ user }: { user: User }) => {
             )}
           </div>
 
-          <div className="flex-1 overflow-y-auto">
+          <div className="flex-1 overflow-y-auto scrollbar-visible">
             {cart.length === 0 ? (
               <EmptyState icon={ShoppingCart} title="Carrito vacío" desc="Agrega productos para comenzar" />
             ) : (
@@ -1381,24 +1545,28 @@ const POSView = ({ user }: { user: User }) => {
             {/* Size selector — from variant.sizes */}
             {selectedVariant && (
               <div>
-                <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wider block mb-2">Talla / Tamaño</label>
+                <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wider block mb-0.5">Talla / Tamaño</label>
+                <p className="text-[10px] text-muted-foreground mb-2 flex items-center gap-1"><MapPin size={10} /> Stock en {user.branch}</p>
                 <div className="flex flex-wrap gap-2">
-                  {selectedVariant.sizes.map((sz) => (
-                    <button
-                      key={sz.size}
-                      onClick={() => { setSelSize(sz.size); setSelQty(1); }}
-                      disabled={sz.stock === 0}
-                      className={`px-3 py-2 rounded-lg border text-sm transition-all flex items-center gap-2 ${selSize === sz.size ? "border-primary bg-primary/10 text-primary font-bold" : sz.stock === 0 ? "border-border/30 text-muted-foreground/30 cursor-not-allowed" : "border-border text-foreground hover:border-primary/40"}`}
-                    >
-                      <span className="font-semibold">{sz.size}</span>
-                      {sz.stock > 0 && sz.stock <= 5
-                        ? <span className="text-[10px] font-bold text-amber-400 bg-amber-500/10 px-1 rounded">{sz.stock} pzs</span>
-                        : sz.stock === 0
-                          ? <span className="text-[10px] text-red-400">Sin stock</span>
-                          : <span className="text-[10px] text-muted-foreground">{sz.stock} pzs</span>
-                      }
-                    </button>
-                  ))}
+                  {selectedVariant.sizes.map((sz) => {
+                    const branchStock = sizeStockAt(sz, user.branch);
+                    return (
+                      <button
+                        key={sz.size}
+                        onClick={() => { setSelSize(sz.size); setSelQty(1); }}
+                        disabled={branchStock === 0}
+                        className={`px-3 py-2 rounded-lg border text-sm transition-all flex items-center gap-2 ${selSize === sz.size ? "border-primary bg-primary/10 text-primary font-bold" : branchStock === 0 ? "border-border/30 text-muted-foreground/30 cursor-not-allowed" : "border-border text-foreground hover:border-primary/40"}`}
+                      >
+                        <span className="font-semibold">{sz.size}</span>
+                        {branchStock > 0 && branchStock <= 5
+                          ? <span className="text-[10px] font-bold text-amber-400 bg-amber-500/10 px-1 rounded">{branchStock} pzs</span>
+                          : branchStock === 0
+                            ? <span className="text-[10px] text-red-400">Sin stock</span>
+                            : <span className="text-[10px] text-muted-foreground">{branchStock} pzs</span>
+                        }
+                      </button>
+                    );
+                  })}
                 </div>
               </div>
             )}
@@ -1411,10 +1579,10 @@ const POSView = ({ user }: { user: User }) => {
                   <div className="flex items-center gap-3 bg-secondary rounded-lg border border-border px-2 py-1">
                     <button onClick={() => setSelQty(Math.max(1, selQty - 1))} className="p-1.5 text-muted-foreground hover:text-foreground"><Minus size={14} /></button>
                     <span className="font-bold text-lg w-6 text-center">{selQty}</span>
-                    <button onClick={() => setSelQty(Math.min(selectedSizeObj.stock, selQty + 1))} className="p-1.5 text-muted-foreground hover:text-foreground"><Plus size={14} /></button>
+                    <button onClick={() => setSelQty(Math.min(sizeStockAt(selectedSizeObj, user.branch), selQty + 1))} className="p-1.5 text-muted-foreground hover:text-foreground"><Plus size={14} /></button>
                   </div>
                   <div className="text-sm text-muted-foreground flex items-center gap-2">
-                    Stock: <StockBadge stock={selectedSizeObj.stock} />
+                    Stock: <StockBadge stock={sizeStockAt(selectedSizeObj, user.branch)} />
                   </div>
                 </div>
                 <p className="text-xs font-mono text-muted-foreground mt-2">SKU: {variantModal.sku} · {selectedVariant?.id}</p>
@@ -1423,7 +1591,7 @@ const POSView = ({ user }: { user: User }) => {
 
             <div className="flex gap-3 mt-2">
               <Btn onClick={() => setVariantModal(null)} variant="secondary" className="flex-1">Cancelar</Btn>
-              <Btn onClick={addToCart} disabled={!selectedSizeObj || selectedSizeObj.stock === 0 || !selSize} className="flex-1">
+              <Btn onClick={addToCart} disabled={!selectedSizeObj || sizeStockAt(selectedSizeObj, user.branch) === 0 || !selSize} className="flex-1">
                 <ShoppingCart size={15} /> Agregar — {selectedSizeObj ? fmt(variantModal.price * selQty) : fmt(variantModal.price)}
               </Btn>
             </div>
@@ -1434,7 +1602,7 @@ const POSView = ({ user }: { user: User }) => {
       {/* Custom item modal */}
       <Modal open={customModal} onClose={() => setCustomModal(false)} title="Artículo personalizado">
         <div className="p-5 flex flex-col gap-4">
-          <Input label="Nombre del artículo" value={custName} onChange={setCustName} placeholder="Ej. Alteración de pantalón" />
+          <Input label="Nombre del artículo" value={custName} onChange={setCustName} placeholder="Ej. Bolsa de regalo" />
           <Input label="Precio unitario" value={custPrice} onChange={setCustPrice} type="number" min={0} step={0.01} placeholder="0.00" />
           <div>
             <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wider block mb-2">Cantidad</label>
@@ -1453,8 +1621,13 @@ const POSView = ({ user }: { user: User }) => {
         </div>
       </Modal>
 
-      {/* Payment modal */}
-      <Modal open={payModal} onClose={() => setPayModal(false)} title="Resumen y pago">
+      {/* Payment modal — closeOnBackdrop disabled so an accidental click outside doesn't discard a checkout with money already entered; the X is the only way out besides Cancelar */}
+      <Modal
+        open={payModal}
+        onClose={() => { setPayModal(false); setCashGiven(""); setMixedCash(""); }}
+        title="Resumen y pago"
+        closeOnBackdrop={false}
+      >
         <div className="p-5 flex flex-col gap-4">
           <div className="bg-secondary rounded-xl p-4 flex flex-col gap-2">
             {cart.map((item) => (
@@ -1480,7 +1653,7 @@ const POSView = ({ user }: { user: User }) => {
               {([
                 { m:"cash" as PaymentMethod, label:"Efectivo", icon:Banknote },
                 { m:"card" as PaymentMethod, label:"Tarjeta", icon:CreditCard },
-                { m:"contactless" as PaymentMethod, label:"Contactless", icon:Wifi },
+                { m:"mixed" as PaymentMethod, label:"Efectivo + Tarjeta", icon:Combine },
               ]).map(({ m, label, icon: Icon }) => (
                 <button
                   key={m}
@@ -1496,8 +1669,15 @@ const POSView = ({ user }: { user: User }) => {
 
           {payMethod === "cash" && (
             <div className="flex flex-col gap-2">
-              <Input label="Efectivo recibido" value={cashGiven} onChange={setCashGiven} type="number" min={0} step={0.5} placeholder={String(subtotal)} />
-              {cashGiven && parseFloat(cashGiven) >= subtotal && (
+              <Input
+                label="Efectivo recibido"
+                value={cashGiven}
+                onChange={(v) => setCashGiven(digitsOnly(v))}
+                type="text"
+                inputMode="numeric"
+                placeholder="0"
+              />
+              {parseInt(cashGiven || "0", 10) >= subtotal && (
                 <div className="flex justify-between bg-emerald-500/10 border border-emerald-500/20 rounded-lg px-4 py-3 text-sm">
                   <span className="text-emerald-400 font-semibold">Cambio</span>
                   <span className="text-emerald-400 font-bold">{fmt(change)}</span>
@@ -1506,11 +1686,28 @@ const POSView = ({ user }: { user: User }) => {
             </div>
           )}
 
+          {payMethod === "mixed" && (
+            <div className="flex flex-col gap-2">
+              <Input
+                label="Monto en efectivo"
+                value={mixedCash}
+                onChange={(v) => setMixedCash(digitsOnly(v))}
+                type="text"
+                inputMode="numeric"
+                placeholder="0"
+              />
+              <div className="flex justify-between bg-secondary border border-border rounded-lg px-4 py-3 text-sm">
+                <span className="text-muted-foreground font-semibold flex items-center gap-1.5"><CreditCard size={13} /> Resto en tarjeta</span>
+                <span className="font-bold text-foreground">{fmt(mixedCardAmount)}</span>
+              </div>
+            </div>
+          )}
+
           <div className="flex gap-3">
-            <Btn onClick={() => setPayModal(false)} variant="secondary" className="flex-1">Cancelar</Btn>
+            <Btn onClick={() => { setPayModal(false); setCashGiven(""); setMixedCash(""); }} variant="secondary" className="flex-1">Cancelar</Btn>
             <Btn
               onClick={confirmSale}
-              disabled={payMethod === "cash" && !!cashGiven && parseFloat(cashGiven) < subtotal}
+              disabled={(payMethod === "cash" && parseInt(cashGiven || "0", 10) < subtotal) || (payMethod === "mixed" && (!mixedCash || mixedCashAmount <= 0 || mixedCashAmount >= subtotal))}
               className="flex-1"
             >
               <Check size={15} /> Confirmar venta
@@ -1548,6 +1745,8 @@ const InventoryView = ({ user }: { user: User }) => {
   const [search, setSearch] = useState("");
   const [filterGender, setFilterGender] = useState<Gender|"all">("all");
   const [filterCat, setFilterCat] = useState("all");
+  // "all" shows a read-only per-branch breakdown; a specific branch shows editable steppers for that branch
+  const [filterBranch, setFilterBranch] = useState<string>("all");
 
   // Expand/collapse product rows for stock editing
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
@@ -1562,12 +1761,32 @@ const InventoryView = ({ user }: { user: User }) => {
   const [vColor, setVColor] = useState("");
   const [vColorHex, setVColorHex] = useState("#888888");
   const [vModel, setVModel] = useState("");
-  const [vSize, setVSize] = useState("");
-  const [vStock, setVStock] = useState(0);
   const [expandedVariantId, setExpandedVariantId] = useState<string | null>(null);
 
   // Barcode modal
   const [barcodeProduct, setBarcodeProduct] = useState<Product | null>(null);
+  const barcodeRef = useRef<HTMLDivElement>(null);
+
+  const printBarcode = () => {
+    const w = window.open("", "_blank", "width=400,height=500");
+    if (!w || !barcodeRef.current) return;
+    w.document.write(`
+      <!DOCTYPE html><html><head>
+      <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: system-ui, sans-serif; background: white; color: #000; padding: 24px; display: flex; justify-content: center; }
+      </style></head><body>${barcodeRef.current.innerHTML}</body></html>`);
+    w.document.close();
+    w.focus();
+    w.print();
+    w.close();
+  };
+
+  // Transfer stock between branches
+  const [transferTarget, setTransferTarget] = useState<{ productId: string; productName: string; variant: ProductVariant; size: string } | null>(null);
+  const [transferFrom, setTransferFrom] = useState("");
+  const [transferTo, setTransferTo] = useState("");
+  const [transferQty, setTransferQty] = useState(1);
 
   // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -1587,24 +1806,60 @@ const InventoryView = ({ user }: { user: User }) => {
   const toggleExpand = (id: string) =>
     setExpanded((prev) => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n; });
 
-  const draftKey = (variantId: string, size: string) => `${variantId}-${size}`;
+  const draftKey = (variantId: string, size: string, branch: string) => `${variantId}-${size}-${branch}`;
 
-  const setStockAbsolute = (productId: string, variantId: string, size: string, value: number) => {
+  const setStockAbsolute = (productId: string, variantId: string, size: string, branch: string, value: number) => {
     const clamped = Math.max(0, isNaN(value) ? 0 : value);
     setState((s) => {
       const ns = { ...s, products: s.products.map((p) => p.id !== productId ? p : {
         ...p, variants: p.variants.map((v) => v.id !== variantId ? v : {
-          ...v, sizes: v.sizes.map((sz) => sz.size !== size ? sz : { ...sz, stock: clamped }),
+          ...v, sizes: v.sizes.map((sz) => sz.size !== size ? sz : { ...sz, stockByBranch: { ...sz.stockByBranch, [branch]: clamped } }),
         }),
       })};
       saveState(ns); return ns;
     });
   };
 
-  const adjustStock = (productId: string, variantId: string, size: string, delta: number, currentStock: number) => {
+  const adjustStock = (productId: string, variantId: string, size: string, branch: string, delta: number, currentStock: number) => {
     const next = Math.max(0, currentStock + delta);
-    setStockDraft((d) => ({ ...d, [draftKey(variantId, size)]: String(next) }));
-    setStockAbsolute(productId, variantId, size, next);
+    setStockDraft((d) => ({ ...d, [draftKey(variantId, size, branch)]: String(next) }));
+    setStockAbsolute(productId, variantId, size, branch, next);
+  };
+
+  // ── transfer stock between branches ─────────────────────────────────────────
+
+  const openTransfer = (productId: string, productName: string, variant: ProductVariant, size: string) => {
+    const sz = variant.sizes.find((s) => s.size === size);
+    const from = state.branches.find((b) => sz && sizeStockAt(sz, b) > 0) ?? state.branches[0];
+    const to = state.branches.find((b) => b !== from) ?? state.branches[1];
+    setTransferTarget({ productId, productName, variant, size });
+    setTransferFrom(from);
+    setTransferTo(to);
+    setTransferQty(1);
+  };
+
+  const transferSizeObj = transferTarget?.variant.sizes.find((s) => s.size === transferTarget.size) ?? null;
+  const transferAvailable = transferSizeObj && transferFrom ? sizeStockAt(transferSizeObj, transferFrom) : 0;
+
+  const doTransfer = () => {
+    if (!transferTarget || !transferFrom || !transferTo || transferFrom === transferTo) return;
+    const qty = Math.max(0, Math.min(transferQty, transferAvailable));
+    if (qty <= 0) return;
+    setState((s) => {
+      const ns = { ...s, products: s.products.map((p) => p.id !== transferTarget.productId ? p : {
+        ...p, variants: p.variants.map((v) => v.id !== transferTarget.variant.id ? v : {
+          ...v, sizes: v.sizes.map((sz) => sz.size !== transferTarget.size ? sz : {
+            ...sz, stockByBranch: {
+              ...sz.stockByBranch,
+              [transferFrom]: sizeStockAt(sz, transferFrom) - qty,
+              [transferTo]: sizeStockAt(sz, transferTo) + qty,
+            },
+          }),
+        }),
+      })};
+      saveState(ns); return ns;
+    });
+    setTransferTarget(null);
   };
 
   // ── product CRUD ─────────────────────────────────────────────────────────────
@@ -1615,10 +1870,8 @@ const InventoryView = ({ user }: { user: User }) => {
 
   const openNew = () => {
     setEditing(null);
-    const b = blankProduct();
-    setForm(b);
-    setVSize(sizesForSystem(b.sizeSystem)[0]);
-    setVColor(""); setVModel(""); setVStock(0); setExpandedVariantId(null);
+    setForm(blankProduct());
+    setVColor(""); setVModel(""); setExpandedVariantId(null);
     setFormOpen(true);
   };
 
@@ -1626,21 +1879,26 @@ const InventoryView = ({ user }: { user: User }) => {
     setEditing(p);
     setForm({ name:p.name, description:p.description, category:p.category, gender:p.gender,
       price:p.price, sizeSystem:p.sizeSystem, variants:p.variants, images:p.images ?? [], active:p.active });
-    setVSize(sizesForSystem(p.sizeSystem)[0]);
-    setVColor(""); setVModel(""); setVStock(0); setExpandedVariantId(null);
+    setVColor(""); setVModel(""); setExpandedVariantId(null);
     setFormOpen(true);
   };
 
   const save = () => {
     if (!form.name || form.price <= 0) return;
+    if (vColor || vModel) {
+      toast.error(`Tienes una variante "${vColor || "?"} · ${vModel || "?"}" sin agregar. Presiona "Agregar" o borra esos campos antes de guardar.`);
+      return;
+    }
+    // Drop draft variants that never got a single talla added — nothing useful to persist.
+    const cleanVariants = form.variants.filter((v) => v.sizes.length > 0);
     setState((s) => {
       let ns: AppState;
       if (editing) {
-        ns = { ...s, products: s.products.map((p) => p.id === editing.id ? { ...p, ...form } : p) };
+        ns = { ...s, products: s.products.map((p) => p.id === editing.id ? { ...p, ...form, variants: cleanVariants } : p) };
       } else {
         const cnt = s.barcodeCounter + 1;
         ns = { ...s, barcodeCounter: cnt, products: [{ id: uid(), sku: generateSKU(form.category, cnt),
-          barcode: generateBarcode(cnt), createdAt: new Date().toISOString().split("T")[0], ...form }, ...s.products] };
+          barcode: generateBarcode(cnt), createdAt: new Date().toISOString().split("T")[0], ...form, variants: cleanVariants }, ...s.products] };
       }
       saveState(ns); return ns;
     });
@@ -1650,44 +1908,91 @@ const InventoryView = ({ user }: { user: User }) => {
   const deleteProduct = (id: string) => setState((s) => { const ns = { ...s, products: s.products.filter((p) => p.id !== id) }; saveState(ns); return ns; });
   const toggleActive = (id: string) => setState((s) => { const ns = { ...s, products: s.products.map((p) => p.id === id ? { ...p, active: !p.active } : p) }; saveState(ns); return ns; });
 
+  const [confirmDeleteProduct, setConfirmDeleteProduct] = useState<Product | null>(null);
+  const deleteProductNow = () => {
+    if (!confirmDeleteProduct) return;
+    deleteProduct(confirmDeleteProduct.id);
+    setConfirmDeleteProduct(null);
+  };
+
   // ── variant builder ───────────────────────────────────────────────────────────
 
   const availSizes = sizesForSystem(form.sizeSystem);
   const usedSizesForVariant = (variantId: string) => form.variants.find((v) => v.id === variantId)?.sizes.map((s) => s.size) ?? [];
 
-  const addVariant = () => {
-    if (!vColor || !vModel || !vSize) return;
-    const hex = PRESET_COLORS.find((c) => c.name === vColor)?.hex ?? vColorHex;
+  // Creates an empty variant shell (no tallas yet) and expands it immediately — from here on,
+  // adding tallas and stock per branch happens directly in the same card used for existing variants.
+  const createVariant = () => {
+    if (!vColor || !vModel) return;
     const exists = form.variants.find((v) => v.color === vColor && v.model === vModel);
     if (exists) {
-      if (exists.sizes.find((s) => s.size === vSize)) return;
-      setForm((f) => ({ ...f, variants: f.variants.map((v) =>
-        v.id === exists.id ? { ...v, sizes: [...v.sizes, { size: vSize, stock: vStock }] } : v) }));
+      toast.error("Ya existe una variante con ese color y modelo");
       setExpandedVariantId(exists.id);
-    } else {
-      const newV: ProductVariant = { id: uid(), color: vColor, colorHex: hex, model: vModel, sizes: [{ size: vSize, stock: vStock }] };
-      setForm((f) => ({ ...f, variants: [...f.variants, newV] }));
-      setExpandedVariantId(newV.id);
+      return;
     }
-    setVColor(""); setVModel(""); setVStock(0);
+    const hex = PRESET_COLORS.find((c) => c.name === vColor)?.hex ?? vColorHex;
+    const initialSizes = form.sizeSystem === "unica" ? [{ size: "Única", stockByBranch: {} }] : [];
+    const newV: ProductVariant = { id: uid(), color: vColor, colorHex: hex, model: vModel, sizes: initialSizes };
+    setForm((f) => ({ ...f, variants: [...f.variants, newV] }));
+    setExpandedVariantId(newV.id);
+    setVColor(""); setVModel("");
   };
 
   const addSizeToVariant = (variantId: string, sz: string) => {
     if (usedSizesForVariant(variantId).includes(sz)) return;
     setForm((f) => ({ ...f, variants: f.variants.map((v) =>
-      v.id === variantId ? { ...v, sizes: [...v.sizes, { size: sz, stock: 0 }] } : v) }));
+      v.id === variantId ? { ...v, sizes: [...v.sizes, { size: sz, stockByBranch: {} }] } : v) }));
   };
 
-  const updateSizeStock = (variantId: string, size: string, stock: number) =>
+  const updateSizeStock = (variantId: string, size: string, branch: string, stock: number) =>
     setForm((f) => ({ ...f, variants: f.variants.map((v) =>
-      v.id === variantId ? { ...v, sizes: v.sizes.map((s) => s.size === size ? { ...s, stock } : s) } : v) }));
+      v.id === variantId ? { ...v, sizes: v.sizes.map((s) => s.size === size ? { ...s, stockByBranch: { ...s.stockByBranch, [branch]: Math.max(0, isNaN(stock) ? 0 : stock) } } : s) } : v) }));
 
   const removeSizeFromVariant = (variantId: string, size: string) =>
     setForm((f) => ({ ...f, variants: f.variants.map((v) =>
       v.id === variantId ? { ...v, sizes: v.sizes.filter((s) => s.size !== size) } : v
-    ).filter((v) => v.sizes.length > 0) }));
+    ) }));
 
   const removeVariant = (id: string) => setForm((f) => ({ ...f, variants: f.variants.filter((v) => v.id !== id) }));
+
+  // Removing a variant or talla that still has stock asks for confirmation first; empty ones go
+  // straight through since there's nothing to lose. For a single talla, the modal also offers a
+  // partial "dar de baja" (write off N pieces from one branch) as an alternative to wiping it all.
+  const [confirmDelete, setConfirmDelete] = useState<{ variantId: string; size?: string; label: string; stock: number; stockByBranch?: Record<string, number> } | null>(null);
+  const [writeOffBranch, setWriteOffBranch] = useState("");
+  const [writeOffQty, setWriteOffQty] = useState(1);
+
+  const requestRemoveVariant = (v: ProductVariant) => {
+    const stock = totalVariantStock(v);
+    if (stock > 0) setConfirmDelete({ variantId: v.id, label: `${v.color} · ${v.model}`, stock });
+    else removeVariant(v.id);
+  };
+
+  const requestRemoveSize = (variantId: string, sz: VariantSize) => {
+    const stock = sizeStockTotal(sz);
+    if (stock > 0) {
+      setConfirmDelete({ variantId, size: sz.size, label: sz.size, stock, stockByBranch: sz.stockByBranch });
+      const stocked = state.branches.filter((b) => (sz.stockByBranch?.[b] ?? 0) > 0);
+      const top = stocked.reduce((best, b) => (sz.stockByBranch![b] > (sz.stockByBranch![best] ?? 0) ? b : best), stocked[0] ?? "");
+      setWriteOffBranch(top);
+      setWriteOffQty(1);
+    } else removeSizeFromVariant(variantId, sz.size);
+  };
+
+  const confirmDeleteNow = () => {
+    if (!confirmDelete) return;
+    if (confirmDelete.size) removeSizeFromVariant(confirmDelete.variantId, confirmDelete.size);
+    else removeVariant(confirmDelete.variantId);
+    setConfirmDelete(null);
+  };
+
+  const writeOffStock = () => {
+    if (!confirmDelete || !confirmDelete.size || !writeOffBranch) return;
+    const current = confirmDelete.stockByBranch?.[writeOffBranch] ?? 0;
+    const next = Math.max(0, current - writeOffQty);
+    updateSizeStock(confirmDelete.variantId, confirmDelete.size, writeOffBranch, next);
+    setConfirmDelete(null);
+  };
 
   // ── render ────────────────────────────────────────────────────────────────────
 
@@ -1715,25 +2020,33 @@ const InventoryView = ({ user }: { user: User }) => {
             </button>
           ))}
         </div>
+        <div className="flex items-center gap-2 overflow-x-auto pb-1 no-scrollbar">
+          <MapPin size={13} className="text-muted-foreground flex-shrink-0" />
+          {[{value:"all",label:"Todas las sucursales"}, ...state.branches.map((b) => ({value:b,label:b}))].map((b) => (
+            <button key={b.value} onClick={() => setFilterBranch(b.value)}
+              className={`flex-shrink-0 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${filterBranch === b.value ? "bg-primary text-white" : "bg-secondary text-muted-foreground hover:text-foreground"}`}>
+              {b.label}
+            </button>
+          ))}
+        </div>
       </div>
 
       {/* Product list */}
-      <div className="flex-1 overflow-y-auto px-4 pb-4 flex flex-col gap-3">
+      <div className="flex-1 overflow-y-auto scrollbar-visible px-4 pb-4 flex flex-col gap-3">
         {filtered.length === 0 && <EmptyState icon={Package} title="Sin productos" desc="Crea tu primer producto con el botón Nuevo" />}
 
         {filtered.map((p) => {
           const isOpen = expanded.has(p.id);
-          const pStock = totalProductStock(p);
+          const pStock = totalProductStock(p, filterBranch === "all" ? undefined : filterBranch);
           return (
-            <div key={p.id} className={`bg-card border rounded-xl overflow-hidden transition-all ${p.active ? "border-border" : "border-border/40 opacity-60"}`}>
+            <div key={p.id} className={`bg-card border rounded-xl overflow-hidden transition-all flex-shrink-0 ${p.active ? "border-border" : "border-border/40 opacity-60"}`}>
               {/* Row: thumbnail + info + actions */}
               <div className="flex items-stretch">
                 <button onClick={() => toggleExpand(p.id)}
-                  className="relative w-20 flex-shrink-0 bg-secondary/40 hover:bg-secondary transition-colors overflow-hidden"
-                  style={{ minHeight: 88 }}>
+                  className="relative w-24 h-24 self-center my-2 ml-2 rounded-lg flex-shrink-0 bg-secondary/40 hover:bg-secondary transition-colors overflow-hidden">
                   {p.images?.[0]
                     ? <img src={p.images[0]} alt={p.name} className="w-full h-full object-cover absolute inset-0" />
-                    : <div className="w-full h-full flex items-center justify-center text-muted-foreground/20 absolute inset-0"><Package size={22} /></div>
+                    : <div className="w-full h-full flex items-center justify-center text-muted-foreground/20 absolute inset-0"><Package size={26} /></div>
                   }
                 </button>
 
@@ -1766,7 +2079,7 @@ const InventoryView = ({ user }: { user: User }) => {
                         {p.active ? <EyeOff size={12} /> : <Eye size={12} />}
                       </Btn>
                       <Btn onClick={(e: React.MouseEvent) => { e.stopPropagation(); setBarcodeProduct(p); }} variant="ghost" size="sm"><Barcode size={12} /></Btn>
-                      <Btn onClick={(e: React.MouseEvent) => { e.stopPropagation(); deleteProduct(p.id); }} variant="danger" size="sm"><Trash2 size={12} /></Btn>
+                      <Btn onClick={(e: React.MouseEvent) => { e.stopPropagation(); setConfirmDeleteProduct(p); }} variant="danger" size="sm"><Trash2 size={12} /></Btn>
                     </div>
                   )}
                 </div>
@@ -1777,11 +2090,11 @@ const InventoryView = ({ user }: { user: User }) => {
                 </button>
               </div>
 
-              {/* Expanded: variants + size steppers */}
+              {/* Expanded: variants + size/branch stock */}
               {isOpen && (
                 <div className="border-t border-border divide-y divide-border/40">
                   {p.variants.map((v) => {
-                    const vStock = totalVariantStock(v);
+                    const vStock = totalVariantStock(v, filterBranch === "all" ? undefined : filterBranch);
                     return (
                       <div key={v.id} className="px-4 py-3">
                         {/* Variant header: color · model  total-pzs */}
@@ -1791,44 +2104,76 @@ const InventoryView = ({ user }: { user: User }) => {
                           <span className="text-muted-foreground text-xs">·</span>
                           <span className="text-xs font-semibold text-foreground">{v.model}</span>
                           <span className={`ml-1 px-2 py-0.5 rounded-full text-xs font-bold ${vStock === 0 ? "bg-red-500/15 text-red-400" : vStock <= 5 ? "bg-amber-500/15 text-amber-400" : "bg-emerald-500/15 text-emerald-400"}`}>
-                            {vStock} pzs
+                            {vStock} pzs{filterBranch !== "all" ? ` · ${filterBranch}` : ""}
                           </span>
                         </div>
 
-                        {/* Size steppers — 2 col grid */}
-                        <div className="pl-5 grid grid-cols-2 gap-1.5">
-                          {v.sizes.map((sz) => {
-                            const key = draftKey(v.id, sz.size);
-                            const draftVal = stockDraft[key];
-                            const displayVal = draftVal !== undefined ? draftVal : String(sz.stock);
-                            return (
-                              <div key={sz.size} className="flex items-center gap-1.5 bg-background border border-border rounded-xl px-2.5 py-1.5">
-                                <span className="font-mono text-[11px] font-bold text-muted-foreground w-7 flex-shrink-0 uppercase">{sz.size}</span>
-                                <div className="flex items-center gap-1 flex-1 justify-end">
-                                  <button onClick={() => adjustStock(p.id, v.id, sz.size, -1, sz.stock)}
-                                    disabled={!canEdit || sz.stock === 0}
-                                    className="w-6 h-6 flex items-center justify-center rounded-lg border border-border bg-secondary text-muted-foreground hover:text-red-400 hover:border-red-500/40 hover:bg-red-500/10 disabled:opacity-30 transition-all">
-                                    <ChevronDown size={12} />
-                                  </button>
-                                  <input type="number" min={0} disabled={!canEdit} value={displayVal}
-                                    onChange={(e) => setStockDraft((d) => ({ ...d, [key]: e.target.value }))}
-                                    onBlur={(e) => {
-                                      const parsed = parseInt(e.target.value, 10);
-                                      setStockDraft((d) => { const n = { ...d }; delete n[key]; return n; });
-                                      setStockAbsolute(p.id, v.id, sz.size, isNaN(parsed) ? sz.stock : parsed);
-                                    }}
-                                    className={`w-10 text-center text-sm font-bold bg-transparent border-0 outline-none disabled:cursor-default [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none ${sz.stock === 0 ? "text-red-400" : sz.stock <= 5 ? "text-amber-400" : "text-emerald-400"}`}
-                                  />
-                                  <button onClick={() => adjustStock(p.id, v.id, sz.size, 1, sz.stock)}
-                                    disabled={!canEdit}
-                                    className="w-6 h-6 flex items-center justify-center rounded-lg border border-border bg-secondary text-muted-foreground hover:text-emerald-400 hover:border-emerald-500/40 hover:bg-emerald-500/10 disabled:opacity-30 transition-all">
-                                    <ChevronUp size={12} />
-                                  </button>
+                        {filterBranch === "all" ? (
+                          /* Aggregate view: read-only indicator of pieces per size, broken down by branch */
+                          <div className="pl-5 flex flex-col gap-1.5">
+                            {v.sizes.map((sz) => {
+                              const entries = state.branches.map((b) => ({ b, qty: sizeStockAt(sz, b) })).filter((e) => e.qty > 0);
+                              return (
+                                <div key={sz.size} className="flex items-center gap-2 bg-background border border-border rounded-xl px-2.5 py-1.5 flex-wrap">
+                                  <span className="font-mono text-[11px] font-bold text-muted-foreground w-7 flex-shrink-0 uppercase">{sz.size}</span>
+                                  <div className="flex items-center gap-1 flex-wrap flex-1">
+                                    {entries.length === 0 ? (
+                                      <span className="text-[10px] text-red-400">Sin stock en ninguna sucursal</span>
+                                    ) : entries.map(({ b, qty }) => (
+                                      <span key={b} className="text-[10px] font-semibold bg-secondary px-1.5 py-0.5 rounded-full text-muted-foreground">
+                                        {b.replace("Sucursal ", "")}: {qty}
+                                      </span>
+                                    ))}
+                                  </div>
+                                  {canEdit && sizeStockTotal(sz) > 0 && (
+                                    <button onClick={() => openTransfer(p.id, p.name, v, sz.size)}
+                                      title="Transferir entre sucursales"
+                                      className="text-muted-foreground hover:text-primary p-1 rounded-lg hover:bg-primary/10 transition-colors flex-shrink-0">
+                                      <ArrowLeftRight size={12} />
+                                    </button>
+                                  )}
+                                  <StockBadge stock={sizeStockTotal(sz)} />
                                 </div>
-                              </div>
-                            );
-                          })}
-                        </div>
+                              );
+                            })}
+                          </div>
+                        ) : (
+                          /* Single-branch view: editable steppers for the selected branch */
+                          <div className="pl-5 grid grid-cols-2 gap-1.5">
+                            {v.sizes.map((sz) => {
+                              const branchStock = sizeStockAt(sz, filterBranch);
+                              const key = draftKey(v.id, sz.size, filterBranch);
+                              const draftVal = stockDraft[key];
+                              const displayVal = draftVal !== undefined ? draftVal : String(branchStock);
+                              return (
+                                <div key={sz.size} className="flex items-center gap-1.5 bg-background border border-border rounded-xl px-2.5 py-1.5">
+                                  <span className="font-mono text-[11px] font-bold text-muted-foreground w-7 flex-shrink-0 uppercase">{sz.size}</span>
+                                  <div className="flex items-center gap-1 flex-1 justify-end">
+                                    <button onClick={() => adjustStock(p.id, v.id, sz.size, filterBranch, -1, branchStock)}
+                                      disabled={!canEdit || branchStock === 0}
+                                      className="w-6 h-6 flex items-center justify-center rounded-lg border border-border bg-secondary text-muted-foreground hover:text-red-400 hover:border-red-500/40 hover:bg-red-500/10 disabled:opacity-30 transition-all">
+                                      <ChevronDown size={12} />
+                                    </button>
+                                    <input type="number" min={0} disabled={!canEdit} value={displayVal}
+                                      onChange={(e) => setStockDraft((d) => ({ ...d, [key]: e.target.value }))}
+                                      onBlur={(e) => {
+                                        const parsed = parseInt(e.target.value, 10);
+                                        setStockDraft((d) => { const n = { ...d }; delete n[key]; return n; });
+                                        setStockAbsolute(p.id, v.id, sz.size, filterBranch, isNaN(parsed) ? branchStock : parsed);
+                                      }}
+                                      className={`w-10 text-center text-sm font-bold bg-transparent border-0 outline-none disabled:cursor-default [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none ${branchStock === 0 ? "text-red-400" : branchStock <= 5 ? "text-amber-400" : "text-emerald-400"}`}
+                                    />
+                                    <button onClick={() => adjustStock(p.id, v.id, sz.size, filterBranch, 1, branchStock)}
+                                      disabled={!canEdit}
+                                      className="w-6 h-6 flex items-center justify-center rounded-lg border border-border bg-secondary text-muted-foreground hover:text-emerald-400 hover:border-emerald-500/40 hover:bg-emerald-500/10 disabled:opacity-30 transition-all">
+                                      <ChevronUp size={12} />
+                                    </button>
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
                       </div>
                     );
                   })}
@@ -1864,14 +2209,17 @@ const InventoryView = ({ user }: { user: User }) => {
             <ImageUpload images={form.images ?? []} onChange={(imgs) => setForm((f) => ({ ...f, images: imgs as string[] }))} />
           </div>
 
-          {/* Size system selector */}
+          {/* Size system selector — locked once the product exists, so a variant edit can't silently
+              orphan already-stocked sizes; only choosable at product creation. */}
           <div>
             <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wider block mb-3">Sistema de tallas</label>
             <div className="grid grid-cols-3 gap-2">
               {SIZE_SYSTEMS.map((sys) => (
                 <button
                   key={sys.value}
+                  disabled={!!editing}
                   onClick={() => {
+                    if (editing || form.sizeSystem === sys.value) return;
                     setForm((f) => ({ ...f, sizeSystem: sys.value, variants: [] }));
                     setVSize(sys.sizes[0]);
                     setExpandedVariantId(null);
@@ -1880,74 +2228,48 @@ const InventoryView = ({ user }: { user: User }) => {
                     form.sizeSystem === sys.value
                       ? "border-primary bg-primary/10 text-primary"
                       : "border-border bg-secondary text-muted-foreground hover:text-foreground hover:border-border/70"
-                  }`}
+                  } ${editing ? "opacity-60 cursor-not-allowed hover:text-muted-foreground hover:border-border" : ""}`}
                 >
                   <span className="font-bold text-sm">{sys.label}</span>
                   <span className="text-[10px] leading-tight opacity-70">{sys.desc}</span>
                 </button>
               ))}
             </div>
-            {form.variants.length > 0 && (
+            {editing ? (
+              <p className="text-[11px] text-muted-foreground mt-2">El sistema de tallas se define al crear el producto y ya no puede cambiarse.</p>
+            ) : form.variants.length > 0 ? (
               <p className="text-[11px] text-amber-400 mt-2">Cambiar el sistema elimina las variantes actuales.</p>
-            )}
+            ) : null}
           </div>
 
           {/* Variant builder */}
           <div>
-            <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wider block mb-3">Variantes — Color + Modelo</label>
+            <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wider block mb-1">Variantes — Color + Modelo</label>
+            <p className="text-[10px] text-muted-foreground mb-3">Agrega un color y modelo, luego sus tallas y el stock por sucursal.</p>
 
-            {/* New variant row */}
-            <div className="bg-secondary/60 border border-border rounded-xl p-3 mb-3 flex flex-col gap-2.5">
-              <p className="text-xs font-semibold text-muted-foreground">Nueva variante</p>
-              <div className="grid grid-cols-2 gap-2">
-                <Select label="Color" value={vColor}
-                  onChange={(c) => { setVColor(c); setVColorHex(PRESET_COLORS.find((p) => p.name === c)?.hex ?? "#888"); }}
-                  options={[{value:"",label:"— Seleccionar"}, ...PRESET_COLORS.map((c) => ({value:c.name,label:c.name}))]} />
-                <Input label="Modelo" value={vModel} onChange={setVModel} placeholder="Slim Fit, Regular…" />
-              </div>
-
-              {/* Talla chips from system */}
-              <div>
-                <label className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wider block mb-1.5">
-                  Talla inicial
-                  {form.sizeSystem === "unica" && <span className="ml-2 text-primary">(auto: Única)</span>}
-                </label>
-                {form.sizeSystem === "unica" ? (
-                  <div className="flex">
-                    <span className="px-3 py-1.5 rounded-lg bg-primary/15 border border-primary/40 text-primary text-xs font-bold">Única</span>
-                  </div>
-                ) : (
-                  <div className="flex flex-wrap gap-1.5">
-                    {availSizes.map((s) => (
-                      <button key={s} onClick={() => setVSize(s)}
-                        className={`px-2.5 py-1 rounded-lg text-xs font-semibold border transition-all ${vSize === s ? "bg-primary text-white border-primary" : "bg-background border-border text-muted-foreground hover:text-foreground"}`}>
-                        {s}
-                      </button>
-                    ))}
-                  </div>
-                )}
-              </div>
-
-              <div className="flex items-end gap-2">
-                <Input label="Stock inicial" value={vStock} onChange={(v) => setVStock(parseInt(v)||0)} type="number" min={0} className="w-32" />
-                <Btn onClick={() => { const sz = form.sizeSystem === "unica" ? "Única" : vSize; if (!vColor || !vModel || !sz) return; const hex = PRESET_COLORS.find((c) => c.name === vColor)?.hex ?? vColorHex; const exists = form.variants.find((v) => v.color === vColor && v.model === vModel); if (exists) { if (!exists.sizes.find((s) => s.size === sz)) { setForm((f) => ({ ...f, variants: f.variants.map((v) => v.id === exists.id ? { ...v, sizes: [...v.sizes, { size: sz, stock: vStock }] } : v) })); setExpandedVariantId(exists.id); } } else { const newV: ProductVariant = { id: uid(), color: vColor, colorHex: hex, model: vModel, sizes: [{ size: sz, stock: vStock }] }; setForm((f) => ({ ...f, variants: [...f.variants, newV] })); setExpandedVariantId(newV.id); } setVColor(""); setVModel(""); setVStock(0); }} variant="outline" size="sm" disabled={!vColor || !vModel} className="flex-shrink-0">
-                  <Plus size={13} /> {form.variants.find((v) => v.color === vColor && v.model === vModel) ? "Agregar talla" : "Crear variante"}
-                </Btn>
-              </div>
+            {/* Add-variant bar: creates an empty card below, expanded, ready for tallas */}
+            <div className="flex items-end gap-2 mb-3">
+              <Select label="Color" value={vColor}
+                onChange={(c) => { setVColor(c); setVColorHex(PRESET_COLORS.find((p) => p.name === c)?.hex ?? "#888"); }}
+                options={[{value:"",label:"— Seleccionar"}, ...PRESET_COLORS.map((c) => ({value:c.name,label:c.name}))]} className="flex-1" />
+              <Input label="Modelo" value={vModel} onChange={setVModel} placeholder="Slim Fit, Regular…" className="flex-1" />
+              <Btn onClick={createVariant} disabled={!vColor || !vModel} size="md" className="flex-shrink-0">
+                <Plus size={14} /> Agregar
+              </Btn>
             </div>
 
-            {/* Existing variants */}
             {form.variants.length > 0 && (
-              <div className="flex flex-col gap-2 max-h-72 overflow-y-auto">
+              <div className="flex flex-col gap-2">
                 {form.variants.map((v) => {
                   const isOpen = expandedVariantId === v.id;
-                  const vTotalStock = v.sizes.reduce((s, sz) => s + sz.stock, 0);
+                  const vTotalStock = totalVariantStock(v);
                   const usedSizes = v.sizes.map((s) => s.size);
                   const freeSizes = availSizes.filter((s) => !usedSizes.includes(s));
                   return (
                     <div key={v.id} className="border border-border rounded-xl overflow-hidden">
-                      <button onClick={() => setExpandedVariantId(isOpen ? null : v.id)}
-                        className="flex items-center gap-2 w-full px-3 py-2.5 bg-secondary hover:bg-accent transition-colors text-left">
+                      <div role="button" tabIndex={0} onClick={() => setExpandedVariantId(isOpen ? null : v.id)}
+                        onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") setExpandedVariantId(isOpen ? null : v.id); }}
+                        className="flex items-center gap-2 w-full px-3 py-2.5 bg-secondary hover:bg-accent transition-colors text-left cursor-pointer">
                         <span className="w-3.5 h-3.5 rounded-full flex-shrink-0 border border-white/20" style={{ background: v.colorHex }} />
                         <span className="text-sm font-semibold text-foreground">{v.color}</span>
                         <span className="text-muted-foreground text-xs">·</span>
@@ -1957,30 +2279,47 @@ const InventoryView = ({ user }: { user: User }) => {
                           <span className="text-xs text-muted-foreground">{v.sizes.length} tallas</span>
                           <ChevronDown size={13} className={`text-muted-foreground transition-transform ${isOpen ? "rotate-180" : ""}`} />
                         </span>
-                        <button onClick={(e) => { e.stopPropagation(); removeVariant(v.id); }} className="text-muted-foreground hover:text-red-400 p-0.5 ml-1">
+                        <button onClick={(e) => { e.stopPropagation(); requestRemoveVariant(v); }} className="text-muted-foreground hover:text-red-400 p-0.5 ml-1">
                           <X size={13} />
                         </button>
-                      </button>
+                      </div>
                       {isOpen && (
-                        <div className="px-3 py-2.5 bg-background/50 flex flex-col gap-2">
-                          {/* Existing sizes with editable stock */}
-                          {v.sizes.map((sz) => (
-                            <div key={sz.size} className="flex items-center gap-2">
-                              <span className="font-mono text-xs font-bold text-foreground w-10">{sz.size}</span>
-                              <div className="flex items-center bg-secondary border border-border rounded-lg overflow-hidden">
-                                <button onClick={() => updateSizeStock(v.id, sz.size, Math.max(0, sz.stock - 1))} className="px-2 py-1 text-muted-foreground hover:text-red-400 transition-colors"><Minus size={11} /></button>
-                                <input type="number" min={0} value={sz.stock}
-                                  onChange={(e) => updateSizeStock(v.id, sz.size, parseInt(e.target.value)||0)}
-                                  className="w-12 text-center text-xs font-bold bg-transparent border-0 outline-none text-foreground [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none" />
-                                <button onClick={() => updateSizeStock(v.id, sz.size, sz.stock + 1)} className="px-2 py-1 text-muted-foreground hover:text-emerald-400 transition-colors"><Plus size={11} /></button>
-                              </div>
-                              <span className="text-xs text-muted-foreground">pzs</span>
-                              <button onClick={() => removeSizeFromVariant(v.id, sz.size)} className="ml-auto text-muted-foreground hover:text-red-400"><X size={11} /></button>
+                        <div className="px-3 py-2.5 bg-background/50 flex flex-col gap-2.5">
+                          {v.sizes.length > 0 && (
+                            <div className="overflow-x-auto -mx-1 px-1">
+                              <table className="text-xs border-separate border-spacing-x-1.5">
+                                <thead>
+                                  <tr>
+                                    <th className="text-left font-semibold text-muted-foreground pb-1">Talla</th>
+                                    {state.branches.map((b) => (
+                                      <th key={b} className="text-center font-semibold text-muted-foreground pb-1 whitespace-nowrap px-1">{b}</th>
+                                    ))}
+                                    <th></th>
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {v.sizes.map((sz) => (
+                                    <tr key={sz.size}>
+                                      <td className="font-mono font-bold text-foreground pr-1 whitespace-nowrap">{sz.size}</td>
+                                      {state.branches.map((b) => (
+                                        <td key={b} className="py-0.5">
+                                          <input type="number" min={0} value={sizeStockAt(sz, b)}
+                                            onChange={(e) => updateSizeStock(v.id, sz.size, b, parseInt(e.target.value) || 0)}
+                                            className="w-14 text-center text-xs font-bold bg-secondary border border-border rounded-lg px-1 py-1.5 outline-none focus:ring-2 focus:ring-primary/40 text-foreground [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none" />
+                                        </td>
+                                      ))}
+                                      <td>
+                                        <button onClick={() => requestRemoveSize(v.id, sz)} className="text-muted-foreground hover:text-red-400 p-1"><X size={12} /></button>
+                                      </td>
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
                             </div>
-                          ))}
+                          )}
                           {/* Add missing sizes */}
                           {freeSizes.length > 0 && (
-                            <div className="pt-1 border-t border-border">
+                            <div className={v.sizes.length > 0 ? "pt-1.5 border-t border-border" : ""}>
                               <p className="text-[10px] text-muted-foreground mb-1.5">Agregar talla:</p>
                               <div className="flex flex-wrap gap-1">
                                 {freeSizes.map((s) => (
@@ -2010,11 +2349,63 @@ const InventoryView = ({ user }: { user: User }) => {
         </div>
       </Modal>
 
+      {/* Confirm removing a variant/talla that still has stock */}
+      <Modal open={!!confirmDelete} onClose={() => setConfirmDelete(null)} title="Eliminar con stock">
+        {confirmDelete && (() => {
+          const stockedBranches = confirmDelete.stockByBranch
+            ? state.branches.filter((b) => (confirmDelete.stockByBranch![b] ?? 0) > 0)
+            : [];
+          const branchStock = confirmDelete.stockByBranch?.[writeOffBranch] ?? 0;
+          return (
+            <div className="p-5 flex flex-col gap-4">
+              <p className="text-sm text-foreground">
+                {confirmDelete.size ? <>La talla <span className="font-semibold">{confirmDelete.label}</span></> : <>La variante <span className="font-semibold">"{confirmDelete.label}"</span></>} tiene <span className="font-bold">{confirmDelete.stock} pzs</span> en stock. ¿Deseas eliminarla de todas formas?
+              </p>
+
+              {confirmDelete.size && stockedBranches.length > 0 && (
+                <div className="bg-secondary/60 border border-border rounded-xl p-3 flex flex-col gap-2.5">
+                  <p className="text-xs font-semibold text-muted-foreground">O dar de baja solo algunas piezas</p>
+                  <div className="grid grid-cols-2 gap-2">
+                    <Select label="Sucursal" value={writeOffBranch} onChange={setWriteOffBranch}
+                      options={stockedBranches.map((b) => ({ value: b, label: `${b} (${confirmDelete.stockByBranch![b]})` }))} />
+                    <Input label="Piezas a dar de baja" value={writeOffQty} type="number" min={1} max={branchStock}
+                      onChange={(v) => setWriteOffQty(Math.max(1, Math.min(branchStock, parseInt(v) || 1)))} />
+                  </div>
+                  <Btn onClick={writeOffStock} variant="outline" size="sm" disabled={!writeOffBranch || branchStock <= 0}>
+                    <Minus size={13} /> Dar de baja {writeOffQty} pza{writeOffQty === 1 ? "" : "s"}
+                  </Btn>
+                </div>
+              )}
+
+              <div className="flex gap-3">
+                <Btn onClick={() => setConfirmDelete(null)} variant="secondary" className="flex-1">Cancelar</Btn>
+                <Btn onClick={confirmDeleteNow} variant="danger" className="flex-1"><Trash2 size={15} /> Eliminar {confirmDelete.size ? "talla" : "todo"}</Btn>
+              </div>
+            </div>
+          );
+        })()}
+      </Modal>
+
+      {/* Confirm deleting a whole product */}
+      <Modal open={!!confirmDeleteProduct} onClose={() => setConfirmDeleteProduct(null)} title="Eliminar producto">
+        {confirmDeleteProduct && (
+          <div className="p-5 flex flex-col gap-4">
+            <p className="text-sm text-foreground">
+              ¿Seguro que quieres eliminar <span className="font-semibold">"{confirmDeleteProduct.name}"</span>? Se perderán sus variantes, tallas y stock. Esta acción no se puede deshacer.
+            </p>
+            <div className="flex gap-3">
+              <Btn onClick={() => setConfirmDeleteProduct(null)} variant="secondary" className="flex-1">Cancelar</Btn>
+              <Btn onClick={deleteProductNow} variant="danger" className="flex-1"><Trash2 size={15} /> Eliminar</Btn>
+            </div>
+          </div>
+        )}
+      </Modal>
+
       {/* Barcode modal */}
       <Modal open={!!barcodeProduct} onClose={() => setBarcodeProduct(null)} title="Código de barras">
         {barcodeProduct && (
           <div className="p-5 flex flex-col gap-4">
-            <div className="bg-white rounded-xl p-5 flex flex-col items-center gap-3">
+            <div ref={barcodeRef} className="bg-white rounded-xl p-5 flex flex-col items-center gap-3">
               <p className="font-bold text-gray-900 text-sm">{barcodeProduct.name}</p>
               <p className="text-xs text-gray-500">{barcodeProduct.sku}</p>
               <div className="flex gap-0.5 items-end mt-1">
@@ -2027,7 +2418,52 @@ const InventoryView = ({ user }: { user: User }) => {
             <div className="bg-secondary rounded-lg px-4 py-3 text-xs font-mono text-muted-foreground flex justify-between">
               <span>Barcode</span><span className="font-bold">{barcodeProduct.barcode}</span>
             </div>
-            <Btn onClick={() => setBarcodeProduct(null)} variant="secondary" className="w-full">Cerrar</Btn>
+            <div className="flex gap-3">
+              <Btn onClick={() => setBarcodeProduct(null)} variant="secondary" className="flex-1">Cerrar</Btn>
+              <Btn onClick={printBarcode} className="flex-1"><Printer size={15} /> Imprimir</Btn>
+            </div>
+          </div>
+        )}
+      </Modal>
+
+      {/* Transfer stock between branches */}
+      <Modal open={!!transferTarget} onClose={() => setTransferTarget(null)} title="Transferir entre sucursales">
+        {transferTarget && (
+          <div className="p-5 flex flex-col gap-4">
+            <div className="flex items-center gap-2">
+              <span className="w-3.5 h-3.5 rounded-full flex-shrink-0 border border-white/15" style={{ background: transferTarget.variant.colorHex }} />
+              <p className="text-sm font-semibold text-foreground">
+                {transferTarget.productName} · {transferTarget.variant.color} · {transferTarget.variant.model} · Talla {transferTarget.size}
+              </p>
+            </div>
+
+            <div className="grid grid-cols-2 gap-2">
+              <Select label="De" value={transferFrom}
+                onChange={(b) => { setTransferFrom(b); if (b === transferTo) setTransferTo(state.branches.find((x) => x !== b) ?? ""); setTransferQty(1); }}
+                options={state.branches.map((b) => ({ value: b, label: `${b} (${transferSizeObj ? sizeStockAt(transferSizeObj, b) : 0})` }))} />
+              <Select label="A" value={transferTo}
+                onChange={setTransferTo}
+                options={state.branches.filter((b) => b !== transferFrom).map((b) => ({ value: b, label: `${b} (${transferSizeObj ? sizeStockAt(transferSizeObj, b) : 0})` }))} />
+            </div>
+
+            <div>
+              <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wider block mb-2">Cantidad a transferir</label>
+              <div className="flex items-center gap-3">
+                <div className="flex items-center gap-3 bg-secondary rounded-lg border border-border px-2 py-1">
+                  <button onClick={() => setTransferQty((q) => Math.max(1, q - 1))} className="p-1.5 text-muted-foreground hover:text-foreground"><Minus size={14} /></button>
+                  <span className="font-bold text-lg w-8 text-center">{transferQty}</span>
+                  <button onClick={() => setTransferQty((q) => Math.min(transferAvailable, q + 1))} className="p-1.5 text-muted-foreground hover:text-foreground"><Plus size={14} /></button>
+                </div>
+                <span className="text-xs text-muted-foreground">Disponibles en {transferFrom}: {transferAvailable}</span>
+              </div>
+            </div>
+
+            <div className="flex gap-3 mt-1">
+              <Btn onClick={() => setTransferTarget(null)} variant="secondary" className="flex-1">Cancelar</Btn>
+              <Btn onClick={doTransfer} disabled={transferAvailable === 0 || transferFrom === transferTo || transferQty <= 0} className="flex-1">
+                <ArrowLeftRight size={15} /> Transferir
+              </Btn>
+            </div>
           </div>
         )}
       </Modal>
@@ -2037,17 +2473,127 @@ const InventoryView = ({ user }: { user: User }) => {
 
 // ─── HISTORY VIEW ─────────────────────────────────────────────────────────────
 
-const HistoryView = ({ user }: { user: User }) => {
-  const { state } = useApp();
-  const [detail, setDetail] = useState<Sale | null>(null);
+// A sale's own subtotal/total stay as originally charged (historical record); returns are tracked
+// per line item via CartItem.returnedQty and netted out wherever revenue is displayed.
+const returnedAmount = (sale: Sale) => sale.items.reduce((sum, it) => sum + (it.returnedQty ?? 0) * it.price, 0);
+const netTotal = (sale: Sale) => sale.total - returnedAmount(sale);
+const hasReturn = (sale: Sale) => sale.items.some((it) => (it.returnedQty ?? 0) > 0);
+
+// "Historial total" tab — the original full sales history (search/filter/sort + edit/delete/devolución).
+const TotalHistoryTab = ({ user }: { user: User }) => {
+  const { state, setState } = useApp();
+  // Holding just the id (not the Sale object) means the modal always reflects the latest
+  // state.sales — otherwise editing/returning/deleting while it's open would leave it showing a
+  // stale snapshot from before the change.
+  const [detailId, setDetailId] = useState<string | null>(null);
+  const detail = detailId ? state.sales.find((s) => s.id === detailId) ?? null : null;
+  const setDetail = (sale: Sale | null) => setDetailId(sale?.id ?? null);
   const [receipt, setReceipt] = useState<Sale | null>(null);
   const [detailProduct, setDetailProduct] = useState<Product | null>(null);
+  const [search, setSearch] = useState("");
   const [filterBranch, setFilterBranch] = useState("all");
   const [filterSeller, setFilterSeller] = useState("all");
   const [filterPay, setFilterPay] = useState("all");
+  const [filterDate, setFilterDate] = useState(todayDateStr());
   const [sortBy, setSortBy] = useState<"date"|"total">("date");
   const [sortDir, setSortDir] = useState<"desc"|"asc">("desc");
   const [showFilters, setShowFilters] = useState(false);
+  const canManage = user.role !== "seller";
+
+  // ── edit sale (admin data only: payment method, seller, branch — never items/qty/stock) ──────
+  const [editingSale, setEditingSale] = useState<Sale | null>(null);
+  const [editForm, setEditForm] = useState({ paymentMethod: "cash" as PaymentMethod, sellerId: "", branch: "", cashAmount: 0, cardAmount: 0 });
+
+  const openEditSale = (sale: Sale) => {
+    setEditingSale(sale);
+    setEditForm({ paymentMethod: sale.paymentMethod, sellerId: sale.sellerId, branch: sale.branch, cashAmount: sale.cashAmount ?? 0, cardAmount: sale.cardAmount ?? 0 });
+  };
+
+  const saveEditSale = () => {
+    if (!editingSale) return;
+    const sellerUser = state.users.find((u) => u.id === editForm.sellerId);
+    setState((s) => {
+      const ns = { ...s, sales: s.sales.map((sale) => sale.id !== editingSale.id ? sale : {
+        ...sale,
+        paymentMethod: editForm.paymentMethod,
+        sellerId: editForm.sellerId,
+        sellerName: sellerUser?.name ?? sale.sellerName,
+        branch: editForm.branch,
+        cashAmount: editForm.paymentMethod === "mixed" ? editForm.cashAmount : undefined,
+        cardAmount: editForm.paymentMethod === "mixed" ? editForm.cardAmount : undefined,
+      }) };
+      saveState(ns);
+      return ns;
+    });
+    setEditingSale(null);
+  };
+
+  // ── delete sale (restores whatever stock hadn't already been returned) ─────────────────────────
+  const [confirmDeleteSale, setConfirmDeleteSale] = useState<Sale | null>(null);
+
+  const deleteSaleNow = () => {
+    if (!confirmDeleteSale) return;
+    const sale = confirmDeleteSale;
+    setState((s) => {
+      const products = s.products.map((p) => ({
+        ...p,
+        variants: p.variants.map((v) => ({
+          ...v,
+          sizes: v.sizes.map((sz) => {
+            const item = sale.items.find((it) => it.variantId === v.id && it.size === sz.size);
+            const qty = item ? item.quantity - (item.returnedQty ?? 0) : 0;
+            if (qty <= 0) return sz;
+            const current = sizeStockAt(sz, sale.branch);
+            return { ...sz, stockByBranch: { ...sz.stockByBranch, [sale.branch]: current + qty } };
+          }),
+        })),
+      }));
+      const ns = { ...s, products, sales: s.sales.filter((sl) => sl.id !== sale.id) };
+      saveState(ns);
+      return ns;
+    });
+    setConfirmDeleteSale(null);
+  };
+
+  // ── devolución: partial per-item return, restocks and marks returnedQty without deleting history ──
+  const [returnSale, setReturnSale] = useState<Sale | null>(null);
+  const [returnQtys, setReturnQtys] = useState<Record<string, number>>({});
+
+  const openReturn = (sale: Sale) => { setReturnSale(sale); setReturnQtys({}); };
+
+  const confirmReturn = () => {
+    if (!returnSale) return;
+    const entries = Object.entries(returnQtys).filter(([, qty]) => qty > 0);
+    if (entries.length === 0) return;
+    setState((s) => {
+      const products = s.products.map((p) => ({
+        ...p,
+        variants: p.variants.map((v) => ({
+          ...v,
+          sizes: v.sizes.map((sz) => {
+            const entry = entries.find(([cartId]) => {
+              const item = returnSale.items.find((it) => it.cartId === cartId);
+              return item && item.variantId === v.id && item.size === sz.size;
+            });
+            if (!entry) return sz;
+            const current = sizeStockAt(sz, returnSale.branch);
+            return { ...sz, stockByBranch: { ...sz.stockByBranch, [returnSale.branch]: current + entry[1] } };
+          }),
+        })),
+      }));
+      const sales = s.sales.map((sale) => sale.id !== returnSale.id ? sale : {
+        ...sale,
+        items: sale.items.map((it) => {
+          const qty = returnQtys[it.cartId] ?? 0;
+          return qty > 0 ? { ...it, returnedQty: (it.returnedQty ?? 0) + qty } : it;
+        }),
+      });
+      const ns = { ...s, products, sales };
+      saveState(ns);
+      return ns;
+    });
+    setReturnSale(null);
+  };
 
   const sellers = useMemo(() => {
     const ids = [...new Set(state.sales.map((s) => s.sellerId))];
@@ -2060,33 +2606,40 @@ const HistoryView = ({ user }: { user: User }) => {
     if (filterBranch !== "all") list = list.filter((s) => s.branch === filterBranch);
     if (filterSeller !== "all") list = list.filter((s) => s.sellerId === filterSeller);
     if (filterPay !== "all") list = list.filter((s) => s.paymentMethod === filterPay);
+    if (filterDate) list = list.filter((s) => dateStr(new Date(s.date)) === filterDate);
+    if (search) {
+      const q = search.toLowerCase();
+      list = list.filter((s) =>
+        s.id.toLowerCase().includes(q) ||
+        s.sellerName.toLowerCase().includes(q) ||
+        s.items.some((it) => it.name.toLowerCase().includes(q))
+      );
+    }
     list.sort((a, b) => {
       const dir = sortDir === "desc" ? -1 : 1;
       if (sortBy === "date") return dir * (new Date(a.date).getTime() - new Date(b.date).getTime());
       return dir * (a.total - b.total);
     });
     return list;
-  }, [state.sales, filterBranch, filterSeller, filterPay, sortBy, sortDir, user]);
+  }, [state.sales, filterBranch, filterSeller, filterPay, filterDate, search, sortBy, sortDir, user]);
 
-  const totalRevenue = filtered.reduce((s, sale) => s + sale.total, 0);
-  const totalCommission = filtered.reduce((s, sale) => s + sale.commissionAmount, 0);
+  const totalRevenue = filtered.reduce((s, sale) => s + netTotal(sale), 0);
 
   const toggleSort = (by: "date"|"total") => {
     if (sortBy === by) setSortDir((d) => d === "desc" ? "asc" : "desc");
     else { setSortBy(by); setSortDir("desc"); }
   };
 
-  const payIcon = { cash: Banknote, card: CreditCard, contactless: Wifi };
+  const payIcon = { cash: Banknote, card: CreditCard, mixed: Combine };
 
   return (
     <div className="flex flex-col h-full">
       <div className="flex-shrink-0 p-4 flex flex-col gap-3">
         {/* Stats */}
-        <div className="grid grid-cols-3 gap-2">
+        <div className="grid grid-cols-2 gap-2">
           {[
             { label:"Ventas", value:String(filtered.length), color:"text-foreground" },
             { label:"Ingresos", value:fmt(totalRevenue), color:"text-primary" },
-            { label:"Comisión", value:fmt(totalCommission), color:"text-emerald-400" },
           ].map((stat) => (
             <div key={stat.label} className="bg-card border border-border rounded-xl px-3 py-2.5 text-center">
               <p className={`font-bold text-sm ${stat.color} leading-tight`}>{stat.value}</p>
@@ -2095,15 +2648,22 @@ const HistoryView = ({ user }: { user: User }) => {
           ))}
         </div>
 
+        <Input value={search} onChange={setSearch} placeholder="Buscar por folio, vendedor o producto…" icon={<Search size={15} />} />
+
         <div className="flex items-center gap-2">
           <button onClick={() => setShowFilters(!showFilters)}
             className={`flex items-center gap-1.5 px-3 py-2 rounded-lg border text-xs font-semibold transition-all ${showFilters ? "bg-primary/10 border-primary/30 text-primary" : "bg-secondary border-border text-muted-foreground hover:text-foreground"}`}>
             <Filter size={13} /> Filtros
           </button>
-          <button onClick={() => toggleSort("date")}
-            className={`flex items-center gap-1.5 px-3 py-2 rounded-lg border text-xs font-semibold transition-all ${sortBy === "date" ? "bg-secondary border-border text-foreground" : "text-muted-foreground border-transparent"}`}>
-            <Calendar size={12} /> Fecha {sortBy === "date" && (sortDir === "desc" ? <ChevronDown size={11} /> : <ChevronUp size={11} />)}
-          </button>
+          <div className="relative flex items-center">
+            <Calendar size={12} className="absolute left-3 text-muted-foreground pointer-events-none" />
+            <input
+              type="date"
+              value={filterDate}
+              onChange={(e) => setFilterDate(e.target.value || todayDateStr())}
+              className="pl-8 pr-2 py-2 rounded-lg border bg-secondary border-border text-foreground text-xs font-semibold focus:outline-none focus:ring-2 focus:ring-primary/40"
+            />
+          </div>
           <button onClick={() => toggleSort("total")}
             className={`flex items-center gap-1.5 px-3 py-2 rounded-lg border text-xs font-semibold transition-all ${sortBy === "total" ? "bg-secondary border-border text-foreground" : "text-muted-foreground border-transparent"}`}>
             <TrendingUp size={12} /> Monto {sortBy === "total" && (sortDir === "desc" ? <ChevronDown size={11} /> : <ChevronUp size={11} />)}
@@ -2114,22 +2674,22 @@ const HistoryView = ({ user }: { user: User }) => {
           <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 bg-secondary border border-border rounded-xl p-3">
             {user.role !== "seller" && (
               <Select label="Sucursal" value={filterBranch} onChange={setFilterBranch}
-                options={[{value:"all",label:"Todas"}, ...BRANCHES.map((b) => ({value:b,label:b}))]} />
+                options={[{value:"all",label:"Todas"}, ...state.branches.map((b) => ({value:b,label:b}))]} />
             )}
             {user.role !== "seller" && (
               <Select label="Vendedor" value={filterSeller} onChange={setFilterSeller}
                 options={[{value:"all",label:"Todos"}, ...sellers.map((s) => ({value:s.id,label:s.name}))]} />
             )}
             <Select label="Pago" value={filterPay} onChange={setFilterPay}
-              options={[{value:"all",label:"Todos"},{value:"cash",label:"Efectivo"},{value:"card",label:"Tarjeta"},{value:"contactless",label:"Contactless"}]} />
+              options={[{value:"all",label:"Todos"},{value:"cash",label:"Efectivo"},{value:"card",label:"Tarjeta"},{value:"mixed",label:"Efectivo + Tarjeta"}]} />
           </div>
         )}
       </div>
 
-      <div className="flex-1 overflow-y-auto px-4 pb-4 flex flex-col gap-2">
+      <div className="flex-1 overflow-y-auto scrollbar-visible px-4 pb-4 flex flex-col gap-2">
         {filtered.length === 0 && <EmptyState icon={ClipboardList} title="Sin ventas" desc="No hay ventas con los filtros seleccionados" />}
         {filtered.map((sale) => {
-          const PayIcon = payIcon[sale.paymentMethod];
+          const PayIcon = payIcon[sale.paymentMethod] ?? Banknote;
           const sellerUser = state.users.find((u) => u.id === sale.sellerId);
           return (
             <button key={sale.id} onClick={() => setDetail(sale)} className="bg-card border border-border rounded-xl p-4 text-left hover:border-primary/30 transition-all w-full">
@@ -2140,6 +2700,7 @@ const HistoryView = ({ user }: { user: User }) => {
                   <div className="flex items-center gap-2 flex-wrap">
                     <span className="font-mono text-xs text-muted-foreground">{sale.id.slice(0,12).toUpperCase()}</span>
                     <Badge className="bg-secondary text-muted-foreground"><MapPin size={10} /> {sale.branch}</Badge>
+                    {hasReturn(sale) && <Badge className="bg-amber-500/20 text-amber-400"><RotateCcw size={10} /> Con devolución</Badge>}
                   </div>
                   <div className="flex items-center gap-2 mt-1.5">
                     <span className="text-xs text-muted-foreground flex items-center gap-1"><Clock size={10} /> {fmtDate(sale.date)}</span>
@@ -2151,7 +2712,14 @@ const HistoryView = ({ user }: { user: User }) => {
                   </div>
                 </div>
                 <div className="flex flex-col items-end gap-1.5 flex-shrink-0">
-                  <span className="font-bold text-primary">{fmt(sale.total)}</span>
+                  {hasReturn(sale) ? (
+                    <span className="flex items-center gap-1.5">
+                      <span className="text-xs text-muted-foreground line-through">{fmt(sale.total)}</span>
+                      <span className="font-bold text-primary">{fmt(netTotal(sale))}</span>
+                    </span>
+                  ) : (
+                    <span className="font-bold text-primary">{fmt(sale.total)}</span>
+                  )}
                   <Badge className={`${
                     sale.paymentMethod === "cash" ? "bg-emerald-500/20 text-emerald-400" :
                     sale.paymentMethod === "card" ? "bg-sky-500/20 text-sky-400" :
@@ -2159,7 +2727,6 @@ const HistoryView = ({ user }: { user: User }) => {
                   }`}>
                     <PayIcon size={10} /> {pLabel(sale.paymentMethod)}
                   </Badge>
-                  <span className="text-xs text-muted-foreground">Comis. {fmt(sale.commissionAmount)}</span>
                 </div>
               </div>
             </button>
@@ -2181,10 +2748,6 @@ const HistoryView = ({ user }: { user: User }) => {
                   <p className="font-semibold text-sm text-foreground">{detailSeller.name}</p>
                   <Badge className={roleBadge(detailSeller.role)}>{rLabel(detailSeller.role)}</Badge>
                 </div>
-                <div className="ml-auto text-right">
-                  <p className="text-xs text-muted-foreground">Comisión</p>
-                  <p className="font-bold text-emerald-400 text-sm">{fmt(detail.commissionAmount)}</p>
-                </div>
               </div>
             )}
             <div className="grid grid-cols-2 gap-3 text-sm">
@@ -2200,6 +2763,12 @@ const HistoryView = ({ user }: { user: User }) => {
                 </div>
               ))}
             </div>
+            {detail.paymentMethod === "mixed" && (
+              <div className="flex gap-4 text-xs -mt-1">
+                <span className="text-muted-foreground">Efectivo: <span className="font-semibold text-foreground">{fmt(detail.cashAmount ?? 0)}</span></span>
+                <span className="text-muted-foreground">Tarjeta: <span className="font-semibold text-foreground">{fmt(detail.cardAmount ?? 0)}</span></span>
+              </div>
+            )}
             <div className="border-t border-border pt-3">
               <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-2">Artículos</p>
               <div className="flex flex-col gap-2">
@@ -2227,7 +2796,10 @@ const HistoryView = ({ user }: { user: User }) => {
                             {[item.color, item.size !== "Único" ? item.size : null].filter(Boolean).join(" / ")} · ×{item.quantity}
                           </p>
                         )}
-                        {item.isCustom && <Badge className="bg-violet-500/20 text-violet-400 mt-0.5">Personalizado</Badge>}
+                        <div className="flex items-center gap-1.5 mt-0.5">
+                          {item.isCustom && <Badge className="bg-violet-500/20 text-violet-400">Personalizado</Badge>}
+                          {!!item.returnedQty && <Badge className="bg-amber-500/20 text-amber-400"><RotateCcw size={9} /> {item.returnedQty} devuelta{item.returnedQty === 1 ? "" : "s"}</Badge>}
+                        </div>
                       </div>
                       <span className="font-bold text-sm text-primary flex-shrink-0">{fmt(item.price * item.quantity)}</span>
                     </div>
@@ -2235,9 +2807,15 @@ const HistoryView = ({ user }: { user: User }) => {
                 })}
               </div>
             </div>
+            {hasReturn(detail) && (
+              <div className="flex justify-between text-sm text-amber-400">
+                <span>Devuelto</span>
+                <span className="font-semibold">-{fmt(returnedAmount(detail))}</span>
+              </div>
+            )}
             <div className="flex justify-between font-bold text-base border-t border-border pt-3">
-              <span>Total</span>
-              <span className="text-primary">{fmt(detail.total)}</span>
+              <span>Total{hasReturn(detail) ? " neto" : ""}</span>
+              <span className="text-primary">{fmt(netTotal(detail))}</span>
             </div>
             <div className="flex gap-3">
               <Btn onClick={() => setDetail(null)} variant="secondary" className="flex-1">Cerrar</Btn>
@@ -2245,6 +2823,13 @@ const HistoryView = ({ user }: { user: User }) => {
                 <Printer size={14} /> Ver ticket
               </Btn>
             </div>
+            {canManage && (
+              <div className="flex gap-3">
+                <Btn onClick={() => openEditSale(detail)} variant="outline" className="flex-1"><Edit2 size={14} /> Editar</Btn>
+                <Btn onClick={() => openReturn(detail)} variant="outline" className="flex-1"><RotateCcw size={14} /> Devolución</Btn>
+                <Btn onClick={() => { setConfirmDeleteSale(detail); setDetail(null); }} variant="danger" className="flex-1"><Trash2 size={14} /> Eliminar</Btn>
+              </div>
+            )}
           </div>
         );
         })()}
@@ -2255,33 +2840,514 @@ const HistoryView = ({ user }: { user: User }) => {
       {detailProduct && (
         <ProductDetailModal product={detailProduct} onClose={() => setDetailProduct(null)} />
       )}
+
+      {/* Edit sale — admin data only (payment method, seller, branch); never items/qty/stock */}
+      <Modal open={!!editingSale} onClose={() => setEditingSale(null)} title="Editar venta">
+        {editingSale && (
+          <div className="p-5 flex flex-col gap-4">
+            <Select label="Método de pago" value={editForm.paymentMethod}
+              onChange={(v) => setEditForm((f) => ({ ...f, paymentMethod: v as PaymentMethod }))}
+              options={[{value:"cash",label:"Efectivo"},{value:"card",label:"Tarjeta"},{value:"mixed",label:"Efectivo + Tarjeta"}]} />
+            {editForm.paymentMethod === "mixed" && (
+              <div className="grid grid-cols-2 gap-2">
+                <Input label="Efectivo" type="number" min={0} value={editForm.cashAmount}
+                  onChange={(v) => setEditForm((f) => ({ ...f, cashAmount: parseFloat(v) || 0 }))} />
+                <Input label="Tarjeta" type="number" min={0} value={editForm.cardAmount}
+                  onChange={(v) => setEditForm((f) => ({ ...f, cardAmount: parseFloat(v) || 0 }))} />
+              </div>
+            )}
+            <Select label="Vendedor" value={editForm.sellerId} onChange={(v) => setEditForm((f) => ({ ...f, sellerId: v }))}
+              options={state.users.map((u) => ({ value: u.id, label: u.name }))} />
+            <Select label="Sucursal" value={editForm.branch} onChange={(v) => setEditForm((f) => ({ ...f, branch: v }))}
+              options={state.branches.map((b) => ({ value: b, label: b }))} />
+            <div className="flex gap-3">
+              <Btn onClick={() => setEditingSale(null)} variant="secondary" className="flex-1">Cancelar</Btn>
+              <Btn onClick={saveEditSale} className="flex-1"><Save size={15} /> Guardar</Btn>
+            </div>
+          </div>
+        )}
+      </Modal>
+
+      {/* Confirm sale deletion */}
+      <Modal open={!!confirmDeleteSale} onClose={() => setConfirmDeleteSale(null)} title="Eliminar venta">
+        {confirmDeleteSale && (
+          <div className="p-5 flex flex-col gap-4">
+            <p className="text-sm text-foreground">
+              ¿Seguro que quieres eliminar la venta <span className="font-semibold">{confirmDeleteSale.id.toUpperCase()}</span>? Se restaurará el stock que no haya sido devuelto ya. Esta acción no se puede deshacer.
+            </p>
+            <div className="flex gap-3">
+              <Btn onClick={() => setConfirmDeleteSale(null)} variant="secondary" className="flex-1">Cancelar</Btn>
+              <Btn onClick={deleteSaleNow} variant="danger" className="flex-1"><Trash2 size={15} /> Eliminar</Btn>
+            </div>
+          </div>
+        )}
+      </Modal>
+
+      {/* Devolución: pick a quantity per item, restocks and marks returnedQty */}
+      <Modal open={!!returnSale} onClose={() => setReturnSale(null)} title="Devolución">
+        {returnSale && (() => {
+          const returnTotal = returnSale.items.reduce((sum, it) => sum + (returnQtys[it.cartId] ?? 0) * it.price, 0);
+          const anyReturnable = returnSale.items.some((it) => it.quantity - (it.returnedQty ?? 0) > 0);
+          return (
+            <div className="p-5 flex flex-col gap-4">
+              <p className="text-xs text-muted-foreground">Indica cuántas piezas de cada artículo se devuelven. El stock regresa a {returnSale.branch}.</p>
+              {anyReturnable ? (
+                <div className="flex flex-col gap-2">
+                  {returnSale.items.map((item) => {
+                    const remaining = item.quantity - (item.returnedQty ?? 0);
+                    if (remaining <= 0) return null;
+                    const qty = returnQtys[item.cartId] ?? 0;
+                    return (
+                      <div key={item.cartId} className="flex items-center gap-3 bg-secondary rounded-lg px-3 py-2">
+                        <div className="flex-1 min-w-0">
+                          <p className="text-sm font-semibold text-foreground truncate">{item.name}</p>
+                          <p className="text-xs text-muted-foreground">{fmt(item.price)} c/u · {remaining} disponible{remaining === 1 ? "" : "s"}</p>
+                        </div>
+                        <div className="flex items-center bg-background border border-border rounded-lg overflow-hidden flex-shrink-0">
+                          <button onClick={() => setReturnQtys((q) => ({ ...q, [item.cartId]: Math.max(0, qty - 1) }))} className="px-2 py-1.5 text-muted-foreground hover:text-red-400"><Minus size={13} /></button>
+                          <span className="w-8 text-center font-bold text-sm">{qty}</span>
+                          <button onClick={() => setReturnQtys((q) => ({ ...q, [item.cartId]: Math.min(remaining, qty + 1) }))} className="px-2 py-1.5 text-muted-foreground hover:text-emerald-400"><Plus size={13} /></button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              ) : (
+                <p className="text-sm text-muted-foreground text-center py-2">Todos los artículos de esta venta ya fueron devueltos.</p>
+              )}
+              <div className="flex justify-between font-bold text-base border-t border-border pt-3">
+                <span>Total a devolver</span>
+                <span className="text-amber-400">{fmt(returnTotal)}</span>
+              </div>
+              <div className="flex gap-3">
+                <Btn onClick={() => setReturnSale(null)} variant="secondary" className="flex-1">Cancelar</Btn>
+                <Btn onClick={confirmReturn} disabled={returnTotal <= 0} variant="danger" className="flex-1"><RotateCcw size={15} /> Confirmar devolución</Btn>
+              </div>
+            </div>
+          );
+        })()}
+      </Modal>
+    </div>
+  );
+};
+
+// ─── DAILY SALES TAB (per-branch, with repeatable "corte de caja") ────────────
+
+const isToday = (iso: string) => {
+  const d = new Date(iso);
+  const now = new Date();
+  return d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth() && d.getDate() === now.getDate();
+};
+
+const todayStr = () => {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+};
+
+const DailySalesTab = ({ user }: { user: User }) => {
+  const { state, setState } = useApp();
+  const isAdmin = user.role === "admin";
+  const [branch, setBranch] = useState<string>(user.branch);
+  const [cutSummary, setCutSummary] = useState<Corte | null>(null);
+  const printRef = useRef<HTMLDivElement>(null);
+
+  const todaySales = useMemo(() => state.sales.filter((s) => isToday(s.date)), [state.sales]);
+
+  const scopedSales = useMemo(() => {
+    if (!isAdmin) return todaySales.filter((s) => s.branch === user.branch);
+    if (branch === "all") return todaySales;
+    return todaySales.filter((s) => s.branch === branch);
+  }, [todaySales, branch, isAdmin, user.branch]);
+
+  const scopeLabel = !isAdmin ? user.branch : branch === "all" ? "Todas las sucursales" : branch;
+  const revenue = scopedSales.reduce((sum, s) => sum + netTotal(s), 0);
+  // Mixed-payment sales keep their originally recorded cash/card split as-is here — apportioning a
+  // partial return across that split has no single right answer, so it's left unadjusted.
+  const cashTotal = scopedSales.reduce((sum, s) => sum + (s.paymentMethod === "cash" ? netTotal(s) : s.paymentMethod === "mixed" ? (s.cashAmount ?? 0) : 0), 0);
+  const cardTotal = scopedSales.reduce((sum, s) => sum + (s.paymentMethod === "card" ? netTotal(s) : s.paymentMethod === "mixed" ? (s.cardAmount ?? 0) : 0), 0);
+
+  const todaysCortes = useMemo(() => [...state.cortes]
+    .filter((c) => isToday(c.performedAt) && (!isAdmin ? c.branch === user.branch : branch === "all" || c.branch === branch))
+    .sort((a, b) => new Date(b.performedAt).getTime() - new Date(a.performedAt).getTime()),
+  [state.cortes, branch, isAdmin, user.branch]);
+
+  const doCorte = () => {
+    const salesSnapshot: CorteSaleSummary[] = scopedSales.map((s) => ({
+      id: s.id, branch: s.branch, total: netTotal(s), paymentMethod: s.paymentMethod,
+      itemsLabel: s.items.map((it) => `${it.quantity}x ${it.name}`).join(", "),
+    }));
+    const corte: Corte = {
+      id: uid(), branch: scopeLabel, performedAt: new Date().toISOString(), performedBy: user.name,
+      salesCount: scopedSales.length, totalRevenue: revenue, cashTotal, cardTotal, sales: salesSnapshot,
+    };
+    setState((s) => {
+      const ns = { ...s, cortes: [corte, ...s.cortes] };
+      saveState(ns);
+      return ns;
+    });
+    setCutSummary(corte);
+  };
+
+  const printCorte = () => {
+    const w = window.open("", "_blank", "width=380,height=600");
+    if (!w || !printRef.current) return;
+    w.document.write(`
+      <!DOCTYPE html><html><head>
+      <style>* { margin: 0; padding: 0; box-sizing: border-box; } body { background: #fff; padding: 10px; width: 300px; }</style>
+      </head><body>${printRef.current.innerHTML}</body></html>`);
+    w.document.close();
+    w.focus();
+    w.print();
+    w.close();
+  };
+
+  return (
+    <div className="flex flex-col h-full">
+      <div className="flex-shrink-0 p-4 flex flex-col gap-3">
+        {isAdmin && (
+          <div className="flex gap-2 overflow-x-auto pb-1 scrollbar-hide">
+            {[{value:"all",label:"Todas las sucursales"}, ...state.branches.map((b) => ({value:b,label:b}))].map((opt) => (
+              <button key={opt.value} onClick={() => setBranch(opt.value)}
+                className={`flex-shrink-0 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${branch === opt.value ? "bg-primary text-white" : "bg-secondary text-muted-foreground hover:text-foreground"}`}>
+                {opt.label}
+              </button>
+            ))}
+          </div>
+        )}
+
+        <div className="grid grid-cols-2 gap-2">
+          <div className="bg-card border border-border rounded-xl px-3 py-2.5 text-center">
+            <p className="font-bold text-sm text-foreground leading-tight">{scopedSales.length}</p>
+            <p className="text-xs text-muted-foreground mt-0.5">Ventas de hoy</p>
+          </div>
+          <div className="bg-card border border-border rounded-xl px-3 py-2.5 text-center">
+            <p className="font-bold text-sm text-primary leading-tight">{fmt(revenue)}</p>
+            <p className="text-xs text-muted-foreground mt-0.5">Ingresos de hoy</p>
+          </div>
+        </div>
+
+        {user.role !== "seller" && (
+          <Btn onClick={doCorte} disabled={scopedSales.length === 0} className="w-full">
+            <Printer size={15} /> Hacer corte — {scopeLabel}
+          </Btn>
+        )}
+      </div>
+
+      <div className="flex-1 overflow-y-auto scrollbar-visible px-4 pb-4 flex flex-col gap-4">
+        <div>
+          <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-2">Ventas de hoy</p>
+          {scopedSales.length === 0 ? (
+            <EmptyState icon={ClipboardList} title="Sin ventas hoy" desc={`Todavía no hay ventas registradas hoy en ${scopeLabel}`} />
+          ) : (
+            <div className="flex flex-col gap-2">
+              {scopedSales.map((sale) => (
+                <div key={sale.id} className="bg-card border border-border rounded-xl p-3 flex items-center justify-between gap-2">
+                  <div className="min-w-0">
+                    <span className="font-mono text-xs text-muted-foreground">{sale.id.toUpperCase()}</span>
+                    <p className="text-xs text-foreground font-semibold mt-0.5">{sale.sellerName} · {fmtDate(sale.date)}</p>
+                  </div>
+                  <span className="font-bold text-sm text-primary flex-shrink-0">{fmt(netTotal(sale))}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {todaysCortes.length > 0 && (
+          <div>
+            <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-2">Cortes realizados hoy</p>
+            <div className="flex flex-col gap-2">
+              {todaysCortes.map((c) => (
+                <button key={c.id} onClick={() => setCutSummary(c)} className="bg-card border border-border rounded-xl p-3 flex items-center justify-between gap-2 text-left hover:border-primary/30 transition-all">
+                  <div className="min-w-0">
+                    <p className="text-xs font-semibold text-foreground">{fmtDate(c.performedAt)} · {c.branch}</p>
+                    <p className="text-xs text-muted-foreground mt-0.5">{c.performedBy} · {c.salesCount} venta{c.salesCount === 1 ? "" : "s"}</p>
+                  </div>
+                  <span className="font-bold text-sm text-primary flex-shrink-0">{fmt(c.totalRevenue)}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+
+      <Modal open={!!cutSummary} onClose={() => setCutSummary(null)} title="Corte de caja">
+        {cutSummary && (
+          <div className="p-5 flex flex-col gap-4">
+            <div ref={printRef} style={tk.wrap}>
+              <div style={{ ...tk.center, marginBottom: 12 }}>
+                <p style={tk.header}>Corte de caja</p>
+                <p style={{ ...tk.muted, marginTop: 4 }}>{cutSummary.branch}</p>
+              </div>
+              <div style={tk.hr} />
+              <div style={{ ...tk.row, marginBottom: 4 }}><span style={tk.muted}>Fecha:</span><span>{fmtDate(cutSummary.performedAt)}</span></div>
+              <div style={{ ...tk.row, marginBottom: 4 }}><span style={tk.muted}>Realizó:</span><span>{cutSummary.performedBy}</span></div>
+              <div style={{ ...tk.row, marginBottom: 4 }}><span style={tk.muted}>Ventas:</span><span>{cutSummary.salesCount}</span></div>
+              <div style={tk.hr} />
+              {(() => {
+                const branchesInCut = [...new Set(cutSummary.sales.map((s) => s.branch))];
+                const multiBranch = branchesInCut.length > 1;
+                return branchesInCut.map((b) => {
+                  const branchSales = cutSummary.sales.filter((s) => s.branch === b);
+                  const branchTotal = branchSales.reduce((sum, s) => sum + s.total, 0);
+                  return (
+                    <div key={b} style={{ marginBottom: 12 }}>
+                      {multiBranch && <p style={{ ...tk.bold, textTransform: "uppercase", marginBottom: 5 }}>{b}</p>}
+                      {branchSales.map((s) => (
+                        <div key={s.id} style={{ marginBottom: 5 }}>
+                          <div style={tk.row}>
+                            <span>{s.id.toUpperCase()} · {pLabel(s.paymentMethod)}</span>
+                            <span style={tk.semibold}>{fmt(s.total)}</span>
+                          </div>
+                          <p style={{ ...tk.muted, ...tk.small }}>{s.itemsLabel}</p>
+                        </div>
+                      ))}
+                      {multiBranch && (
+                        <div style={{ ...tk.row, ...tk.semibold, borderTop: "1px dashed #000", paddingTop: 4, marginTop: 4 }}>
+                          <span>Subtotal {b}</span><span>{fmt(branchTotal)}</span>
+                        </div>
+                      )}
+                    </div>
+                  );
+                });
+              })()}
+              <div style={tk.hr} />
+              <div style={{ ...tk.row, marginBottom: 4 }}><span style={tk.muted}>Efectivo:</span><span>{fmt(cutSummary.cashTotal)}</span></div>
+              <div style={{ ...tk.row, marginBottom: 4 }}><span style={tk.muted}>Tarjeta:</span><span>{fmt(cutSummary.cardTotal)}</span></div>
+              <div style={tk.hr} />
+              <div style={{ ...tk.row, ...tk.bold, ...tk.base }}><span>TOTAL</span><span>{fmt(cutSummary.totalRevenue)}</span></div>
+            </div>
+            <div className="flex gap-3">
+              <Btn onClick={() => setCutSummary(null)} variant="secondary" className="flex-1">Cerrar</Btn>
+              <Btn onClick={printCorte} className="flex-1"><Printer size={15} /> Imprimir</Btn>
+            </div>
+          </div>
+        )}
+      </Modal>
+    </div>
+  );
+};
+
+// ─── HISTORY VIEW (container: "Ventas por sucursal" default, "Historial total" second) ───────
+
+const HistoryView = ({ user }: { user: User }) => {
+  const [tab, setTab] = useState<"daily" | "total">("daily");
+  return (
+    <div className="flex flex-col h-full">
+      <div className="flex-shrink-0 px-4 pt-4 flex gap-2">
+        {[{value:"daily",label:"Ventas por sucursal"},{value:"total",label:"Historial total"}].map((t) => (
+          <button key={t.value} onClick={() => setTab(t.value as "daily" | "total")}
+            className={`px-3 py-2 rounded-lg text-xs font-semibold transition-all ${tab === t.value ? "bg-primary text-white" : "bg-secondary text-muted-foreground hover:text-foreground"}`}>
+            {t.label}
+          </button>
+        ))}
+      </div>
+      <div className="flex-1 overflow-hidden">
+        {tab === "daily" ? <DailySalesTab user={user} /> : <TotalHistoryTab user={user} />}
+      </div>
+    </div>
+  );
+};
+
+// ─── COMMISSIONS VIEW ─────────────────────────────────────────────────────────
+
+const tierLabel = (t: CommissionTier) =>
+  t.max === null ? `Desde ${fmt(t.min)}` : `${fmt(t.min)} – ${fmt(t.max)}`;
+
+const findTier = (tiers: CommissionTier[], amount: number): CommissionTier | null => {
+  const sorted = [...tiers].sort((a, b) => a.min - b.min);
+  for (const t of sorted) {
+    if (amount >= t.min && (t.max === null || amount < t.max)) return t;
+  }
+  return sorted[sorted.length - 1] ?? null;
+};
+
+const CommissionsView = () => {
+  const { state, setState } = useApp();
+  const [weeks, setWeeks] = useState(1);
+  const [filterBranch, setFilterBranch] = useState("all");
+  const [editingTiers, setEditingTiers] = useState(false);
+  const [editingSellerId, setEditingSellerId] = useState<string | null>(null);
+
+  const tiers = useMemo(() => [...state.commissionTiers].sort((a, b) => a.min - b.min), [state.commissionTiers]);
+
+  const periodStart = useMemo(() => {
+    const d = new Date();
+    d.setDate(d.getDate() - weeks * 7);
+    return d;
+  }, [weeks]);
+
+  const periodSales = useMemo(() => {
+    let list = state.sales.filter((s) => new Date(s.date) >= periodStart);
+    if (filterBranch !== "all") list = list.filter((s) => s.branch === filterBranch);
+    return list;
+  }, [state.sales, periodStart, filterBranch]);
+
+  const summary = useMemo(() => {
+    const map = new Map<string, { id: string; name: string; sales: number; revenue: number }>();
+    for (const sale of periodSales) {
+      const existing = map.get(sale.sellerId);
+      if (existing) { existing.sales += 1; existing.revenue += sale.total; }
+      else map.set(sale.sellerId, { id: sale.sellerId, name: sale.sellerName, sales: 1, revenue: sale.total });
+    }
+    return [...map.values()].map((row) => {
+      const su = state.users.find((u) => u.id === row.id);
+      const tier = findTier(tiers, row.revenue);
+      const percent = su?.commissionMode === "custom" ? su.customCommissionPercent : (tier?.percent ?? 0);
+      const rateLabel = su?.commissionMode === "custom" ? "Personalizado" : (tier ? tierLabel(tier) : "Sin rango");
+      return { ...row, user: su, percent, rateLabel, commission: row.revenue * (percent / 100) };
+    }).sort((a, b) => b.commission - a.commission);
+  }, [periodSales, state.users, tiers]);
+
+  const totalCommission = summary.reduce((s, r) => s + r.commission, 0);
+
+  const updateTier = (id: string, patch: Partial<CommissionTier>) => setState((s) => {
+    const ns = { ...s, commissionTiers: s.commissionTiers.map((t) => t.id === id ? { ...t, ...patch } : t) };
+    saveState(ns); return ns;
+  });
+  const addTier = () => setState((s) => {
+    const sorted = [...s.commissionTiers].sort((a, b) => a.min - b.min);
+    const last = sorted[sorted.length - 1];
+    const newMin = last ? (last.max ?? last.min + 10000) : 0;
+    const ns = { ...s, commissionTiers: [...s.commissionTiers, { id: uid(), min: newMin, max: null, percent: 0 }] };
+    saveState(ns); return ns;
+  });
+  const removeTier = (id: string) => setState((s) => {
+    const ns = { ...s, commissionTiers: s.commissionTiers.filter((t) => t.id !== id) };
+    saveState(ns); return ns;
+  });
+
+  const setSellerCommission = (id: string, patch: Partial<Pick<User, "commissionMode" | "customCommissionPercent">>) => setState((s) => {
+    const ns = { ...s, users: s.users.map((u) => u.id === id ? { ...u, ...patch } : u) };
+    saveState(ns); return ns;
+  });
+
+  return (
+    <div className="flex flex-col h-full">
+      <div className="flex-shrink-0 p-4 flex flex-col gap-3">
+        <div>
+          <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wider block mb-1.5">Periodo</label>
+          <div className="flex gap-1.5 overflow-x-auto no-scrollbar">
+            {[1, 2, 3, 4, 5, 6].map((w) => (
+              <button key={w} onClick={() => setWeeks(w)}
+                className={`flex-shrink-0 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${weeks === w ? "bg-primary text-white" : "bg-secondary text-muted-foreground hover:text-foreground"}`}>
+                {w} {w === 1 ? "semana" : "semanas"}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="flex items-center gap-2 flex-wrap">
+          <Select label="" value={filterBranch} onChange={setFilterBranch} className="flex-1 min-w-[160px]"
+            options={[{value:"all",label:"Todas las sucursales"}, ...state.branches.map((b) => ({value:b,label:b}))]} />
+          <button onClick={() => setEditingTiers(!editingTiers)}
+            className={`flex items-center gap-1.5 px-3 py-2.5 rounded-lg border text-xs font-semibold transition-all flex-shrink-0 ${editingTiers ? "bg-primary/10 border-primary/30 text-primary" : "bg-secondary border-border text-muted-foreground hover:text-foreground"}`}>
+            <SlidersHorizontal size={13} /> Rangos de comisión
+          </button>
+        </div>
+      </div>
+
+      <Modal open={editingTiers} onClose={() => setEditingTiers(false)} title="Rangos de comisión">
+        <div className="p-5 flex flex-col gap-2">
+          <p className="text-xs text-muted-foreground -mt-1">Deja "Hasta" vacío para "sin límite" (debería ser solo el último rango).</p>
+          {tiers.map((t) => (
+            <div key={t.id} className="flex items-center gap-2 bg-secondary border border-border rounded-lg px-2.5 py-2">
+              <Input label="Desde" value={t.min} onChange={(v) => updateTier(t.id, { min: parseFloat(v) || 0 })} type="number" min={0} className="flex-1" />
+              <Input label="Hasta" value={t.max ?? ""} onChange={(v) => updateTier(t.id, { max: v === "" ? null : (parseFloat(v) || 0) })} type="number" min={0} placeholder="Sin límite" className="flex-1" />
+              <Input label="%" value={t.percent} onChange={(v) => updateTier(t.id, { percent: parseFloat(v) || 0 })} type="number" min={0} step={0.5} className="w-20" />
+              <button onClick={() => removeTier(t.id)} className="text-muted-foreground hover:text-red-400 p-1.5 mt-4 flex-shrink-0"><Trash2 size={14} /></button>
+            </div>
+          ))}
+          <Btn onClick={addTier} variant="outline" size="sm" className="self-start"><Plus size={13} /> Agregar rango</Btn>
+          <Btn onClick={() => setEditingTiers(false)} className="mt-2"><Check size={15} /> Listo</Btn>
+        </div>
+      </Modal>
+
+      <div className="flex-1 overflow-y-auto scrollbar-visible px-4 pb-4 flex flex-col gap-2">
+        {summary.length === 0 && (
+          <EmptyState icon={Percent} title="Sin ventas en este periodo" desc="Prueba con un periodo más largo o revisa el filtro de sucursal" />
+        )}
+        {summary.map((row) => (
+          <div key={row.id} className="bg-card border border-border rounded-xl p-4 flex flex-col gap-3">
+            <div className="flex items-center gap-3">
+              {row.user && <Avatar user={row.user} size="sm" />}
+              <div className="flex-1 min-w-0">
+                <p className="text-sm font-semibold text-foreground truncate">{row.name}</p>
+                <p className="text-xs text-muted-foreground">{row.sales} {row.sales === 1 ? "venta" : "ventas"} · {fmt(row.revenue)} vendido</p>
+              </div>
+              <div className="text-right flex-shrink-0">
+                <p className="font-bold text-emerald-400">{fmt(row.commission)}</p>
+                <p className="text-[10px] text-muted-foreground">{row.percent}% · {row.rateLabel}</p>
+              </div>
+            </div>
+
+            {editingSellerId === row.id ? (
+              <div className="flex items-center gap-2 border-t border-border pt-3">
+                <div className="flex gap-1.5 flex-1">
+                  {(["tiers","custom"] as const).map((m) => (
+                    <button key={m} onClick={() => setSellerCommission(row.id, { commissionMode: m })}
+                      className={`flex-1 py-1.5 rounded-lg border text-xs font-semibold transition-all ${row.user?.commissionMode === m ? "border-primary bg-primary/10 text-primary" : "border-border text-muted-foreground hover:text-foreground"}`}>
+                      {m === "tiers" ? "Por rangos" : "Personalizado"}
+                    </button>
+                  ))}
+                </div>
+                {row.user?.commissionMode === "custom" && (
+                  <Input value={row.user.customCommissionPercent} onChange={(v) => setSellerCommission(row.id, { customCommissionPercent: parseFloat(v) || 0 })}
+                    type="number" min={0} step={0.5} className="w-20" />
+                )}
+                <button onClick={() => setEditingSellerId(null)} className="text-muted-foreground hover:text-foreground p-1.5"><Check size={15} /></button>
+              </div>
+            ) : (
+              <button onClick={() => setEditingSellerId(row.id)} className="text-xs text-primary font-semibold text-left border-t border-border pt-2 hover:underline">
+                Cambiar tipo de comisión
+              </button>
+            )}
+          </div>
+        ))}
+        {summary.length > 0 && (
+          <div className="flex items-center justify-between bg-secondary border border-border rounded-xl px-4 py-3 mt-1">
+            <span className="text-sm font-semibold text-muted-foreground">Total a pagar</span>
+            <span className="font-bold text-lg text-emerald-400">{fmt(totalCommission)}</span>
+          </div>
+        )}
+      </div>
     </div>
   );
 };
 
 // ─── USERS VIEW ───────────────────────────────────────────────────────────────
 
-const blankUser = (): Omit<User,"id"> => ({
-  name:"", email:"", password:"", role:"seller", branch:BRANCHES[0],
-  commissionType:"percentage", commissionValue:5, active:true, avatar:undefined,
+const blankUser = (defaultBranch: string): Omit<User,"id"> => ({
+  name:"", username:"", password:"", role:"seller", branch:defaultBranch,
+  commissionMode:"tiers", customCommissionPercent:5, active:true, avatar:undefined,
 });
 
 const UsersView = () => {
   const { state, setState } = useApp();
   const [formOpen, setFormOpen] = useState(false);
   const [editing, setEditing] = useState<User | null>(null);
-  const [form, setForm] = useState(blankUser());
+  const [form, setForm] = useState(blankUser(state.branches[0]));
   const [showPw, setShowPw] = useState(false);
 
-  const openNew = () => { setEditing(null); setForm(blankUser()); setFormOpen(true); };
-  const openEdit = (u: User) => { setEditing(u); setForm({ name:u.name, email:u.email, password:u.password, role:u.role, branch:u.branch, commissionType:u.commissionType, commissionValue:u.commissionValue, active:u.active, avatar:u.avatar }); setFormOpen(true); };
+  const openNew = () => { setEditing(null); setForm(blankUser(state.branches[0])); setFormOpen(true); };
+  const openEdit = (u: User) => {
+    setEditing(u);
+    // password intentionally left blank: the server never sends it back (see User.password),
+    // and a blank value here means "keep the current one" when saving.
+    setForm({ name:u.name, username:u.username, password:"", role:u.role, branch:u.branch, commissionMode:u.commissionMode, customCommissionPercent:u.customCommissionPercent, active:u.active, avatar:u.avatar });
+    setFormOpen(true);
+  };
 
   const save = () => {
-    if (!form.name || !form.email) return;
+    if (!form.name || !form.username || (!editing && !form.password)) return;
+    // Blank password on an edit means "don't change it" — never let that overwrite the
+    // (already-absent, since the server never sends it) local `password` field with "".
+    const { password, ...formWithoutPassword } = form;
+    const patch = password ? form : formWithoutPassword;
     setState((s) => {
       let ns: AppState;
       if (editing) {
-        ns = { ...s, users: s.users.map((u) => u.id === editing.id ? { ...u, ...form } : u) };
+        ns = { ...s, users: s.users.map((u) => u.id === editing.id ? { ...u, ...patch } : u) };
       } else {
         ns = { ...s, users: [...s.users, { id: uid(), ...form }] };
       }
@@ -2307,6 +3373,13 @@ const UsersView = () => {
     });
   };
 
+  const [confirmDeleteUser, setConfirmDeleteUser] = useState<User | null>(null);
+  const deleteUserNow = () => {
+    if (!confirmDeleteUser) return;
+    deleteUser(confirmDeleteUser.id);
+    setConfirmDeleteUser(null);
+  };
+
   return (
     <div className="flex flex-col h-full">
       <div className="flex-shrink-0 p-4 flex justify-between items-center">
@@ -2314,7 +3387,7 @@ const UsersView = () => {
         <Btn onClick={openNew} size="md"><Plus size={15} /> Nuevo usuario</Btn>
       </div>
 
-      <div className="flex-1 overflow-y-auto px-4 pb-4 flex flex-col gap-3">
+      <div className="flex-1 overflow-y-auto scrollbar-visible px-4 pb-4 flex flex-col gap-3">
         {state.users.map((u) => (
           <div key={u.id} className={`bg-card border rounded-xl p-4 transition-all ${u.active ? "border-border" : "border-border/40 opacity-60"}`}>
             <div className="flex items-start gap-3">
@@ -2327,11 +3400,11 @@ const UsersView = () => {
                   <Badge className={roleBadge(u.role)}>{rLabel(u.role)}</Badge>
                   {!u.active && <Badge className="bg-red-500/20 text-red-400">Inactivo</Badge>}
                 </div>
-                <p className="text-xs text-muted-foreground mt-0.5">{u.email}</p>
+                <p className="text-xs text-muted-foreground mt-0.5">{u.username}</p>
                 <div className="flex items-center gap-3 mt-2 flex-wrap">
                   <span className="text-xs text-muted-foreground flex items-center gap-1"><MapPin size={10} /> {u.branch}</span>
                   <span className="text-xs bg-emerald-500/15 text-emerald-400 px-2 py-0.5 rounded-full font-semibold">
-                    Comisión: {u.commissionType === "percentage" ? `${u.commissionValue}%` : fmt(u.commissionValue)}
+                    Comisión: {u.commissionMode === "custom" ? `${u.customCommissionPercent}% personalizado` : "Por rangos"}
                   </span>
                 </div>
               </div>
@@ -2340,7 +3413,7 @@ const UsersView = () => {
                 <Btn onClick={() => toggleActive(u.id)} variant="ghost" size="sm" className={u.active ? "text-amber-400" : "text-emerald-400"}>
                   {u.active ? <EyeOff size={13} /> : <Eye size={13} />}
                 </Btn>
-                <Btn onClick={() => deleteUser(u.id)} variant="danger" size="sm"><Trash2 size={13} /></Btn>
+                <Btn onClick={() => setConfirmDeleteUser(u)} variant="danger" size="sm"><Trash2 size={13} /></Btn>
               </div>
             </div>
           </div>
@@ -2358,12 +3431,14 @@ const UsersView = () => {
             />
           </div>
           <Input label="Nombre completo" value={form.name} onChange={(v) => setForm((f) => ({ ...f, name: v }))} placeholder="Nombre Apellido" />
-          <Input label="Correo electrónico" value={form.email} onChange={(v) => setForm((f) => ({ ...f, email: v }))} type="email" placeholder="usuario@modaelite.com" />
+          <Input label="Usuario" value={form.username} onChange={(v) => setForm((f) => ({ ...f, username: v }))} placeholder="usuario" />
           <div className="flex flex-col gap-1.5">
-            <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Contraseña</label>
+            <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">
+              Contraseña{editing && <span className="normal-case text-muted-foreground/70 font-normal"> (dejar en blanco para no cambiarla)</span>}
+            </label>
             <div className="relative">
-              <input type={showPw ? "text" : "password"} value={form.password} onChange={(e) => setForm((f) => ({ ...f, password: e.target.value }))}
-                placeholder="Mínimo 6 caracteres"
+              <input type={showPw ? "text" : "password"} value={form.password ?? ""} onChange={(e) => setForm((f) => ({ ...f, password: e.target.value }))}
+                placeholder={editing ? "••••••••" : "Mínimo 6 caracteres"}
                 className="w-full bg-secondary border border-border rounded-lg px-3 py-2.5 pr-10 text-sm text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-2 focus:ring-primary/40 transition-all" />
               <button type="button" onClick={() => setShowPw(!showPw)} className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground">
                 {showPw ? <EyeOff size={15} /> : <Eye size={15} />}
@@ -2374,33 +3449,240 @@ const UsersView = () => {
             <Select label="Rol" value={form.role} onChange={(v) => setForm((f) => ({ ...f, role: v as UserRole }))}
               options={[{value:"admin",label:"Administrador"},{value:"warehouse",label:"Jefe Almacén"},{value:"seller",label:"Vendedor"}]} />
             <Select label="Sucursal" value={form.branch} onChange={(v) => setForm((f) => ({ ...f, branch: v }))}
-              options={BRANCHES.map((b) => ({value:b,label:b}))} />
+              options={state.branches.map((b) => ({value:b,label:b}))} />
           </div>
-          <div className="flex flex-col gap-3 bg-secondary rounded-xl p-3 border border-border">
-            <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Sistema de comisiones</label>
+          <div className="flex flex-col gap-1.5">
+            <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Tipo de comisión</label>
             <div className="flex gap-2">
-              {(["percentage","fixed"] as const).map((t) => (
-                <button key={t} onClick={() => setForm((f) => ({ ...f, commissionType: t }))}
-                  className={`flex-1 py-2 rounded-lg border text-xs font-semibold transition-all ${form.commissionType === t ? "border-primary bg-primary/10 text-primary" : "border-border text-muted-foreground hover:text-foreground"}`}>
-                  {t === "percentage" ? "Porcentaje %" : "Monto fijo $"}
+              {(["tiers","custom"] as const).map((m) => (
+                <button key={m} type="button" onClick={() => setForm((f) => ({ ...f, commissionMode: m }))}
+                  className={`flex-1 py-2 rounded-lg border text-xs font-semibold transition-all ${form.commissionMode === m ? "border-primary bg-primary/10 text-primary" : "border-border text-muted-foreground hover:text-foreground"}`}>
+                  {m === "tiers" ? "Por rangos" : "Personalizado"}
                 </button>
               ))}
             </div>
-            <Input
-              label={form.commissionType === "percentage" ? "Porcentaje de comisión" : "Monto por venta (MXN)"}
-              value={form.commissionValue}
-              onChange={(v) => setForm((f) => ({ ...f, commissionValue: parseFloat(v) || 0 }))}
-              type="number" min={0} step={form.commissionType === "percentage" ? 0.5 : 10}
-              placeholder={form.commissionType === "percentage" ? "5" : "50"}
-            />
+            <p className="text-[10px] text-muted-foreground">
+              El porcentaje (de rango o personalizado) se ajusta en la página <span className="font-semibold text-foreground">Comisiones</span>.
+            </p>
           </div>
           <div className="flex gap-3">
             <Btn onClick={() => setFormOpen(false)} variant="secondary" className="flex-1">Cancelar</Btn>
-            <Btn onClick={save} disabled={!form.name || !form.email} className="flex-1">
+            <Btn onClick={save} disabled={!form.name || !form.username} className="flex-1">
               <Save size={15} /> {editing ? "Guardar" : "Crear usuario"}
             </Btn>
           </div>
         </div>
+      </Modal>
+
+      <Modal open={!!confirmDeleteUser} onClose={() => setConfirmDeleteUser(null)} title="Eliminar usuario">
+        {confirmDeleteUser && (
+          <div className="p-5 flex flex-col gap-4">
+            <p className="text-sm text-foreground">
+              ¿Seguro que quieres eliminar a <span className="font-semibold">{confirmDeleteUser.name}</span>? Esta acción no se puede deshacer.
+            </p>
+            <div className="flex gap-3">
+              <Btn onClick={() => setConfirmDeleteUser(null)} variant="secondary" className="flex-1">Cancelar</Btn>
+              <Btn onClick={deleteUserNow} variant="danger" className="flex-1"><Trash2 size={15} /> Eliminar</Btn>
+            </div>
+          </div>
+        )}
+      </Modal>
+    </div>
+  );
+};
+
+// ─── BRANCHES VIEW ────────────────────────────────────────────────────────────
+
+const BranchesView = () => {
+  const { state, setState } = useApp();
+  const [newName, setNewName] = useState("");
+  const [editingBranch, setEditingBranch] = useState<string | null>(null);
+  const [editValue, setEditValue] = useState("");
+
+  // Per-branch logo — used by the mandatory post-login branch picker (sellers). Uploaded/replaced
+  // one branch at a time via a single shared hidden file input.
+  const logoInputRef = useRef<HTMLInputElement>(null);
+  const [uploadingBranch, setUploadingBranch] = useState<string | null>(null);
+  const [pendingLogoBranch, setPendingLogoBranch] = useState<string | null>(null);
+
+  const triggerLogoUpload = (branch: string) => {
+    setPendingLogoBranch(branch);
+    logoInputRef.current?.click();
+  };
+
+  const handleLogoFile = async (files: FileList | null) => {
+    const file = files?.[0];
+    const branch = pendingLogoBranch;
+    if (!file || !branch) return;
+    setUploadingBranch(branch);
+    try {
+      const url = await uploadImage(file, "logos", state.branchLogos?.[branch]);
+      setState((s) => {
+        const ns = { ...s, branchLogos: { ...s.branchLogos, [branch]: url } };
+        saveState(ns);
+        return ns;
+      });
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Error al subir el logo");
+    } finally {
+      setUploadingBranch(null);
+      setPendingLogoBranch(null);
+      if (logoInputRef.current) logoInputRef.current.value = "";
+    }
+  };
+
+  const usersInBranch = (name: string) => state.users.filter((u) => u.branch === name).length;
+  const hasStockInBranch = (name: string) =>
+    state.products.some((p) => p.variants.some((v) => v.sizes.some((sz) => (sz.stockByBranch?.[name] ?? 0) > 0)));
+
+  const addBranch = () => {
+    const trimmed = newName.trim();
+    if (!trimmed) return;
+    if (state.branches.some((b) => b.toLowerCase() === trimmed.toLowerCase())) {
+      toast.error("Ya existe una sucursal con ese nombre");
+      return;
+    }
+    setState((s) => {
+      const ns = { ...s, branches: [...s.branches, trimmed] };
+      saveState(ns);
+      return ns;
+    });
+    setNewName("");
+  };
+
+  const startEdit = (name: string) => { setEditingBranch(name); setEditValue(name); };
+  const cancelEdit = () => { setEditingBranch(null); setEditValue(""); };
+
+  const confirmRename = (oldName: string) => {
+    const trimmed = editValue.trim();
+    if (!trimmed) { toast.error("El nombre no puede estar vacío"); return; }
+    if (trimmed !== oldName && state.branches.some((b) => b.toLowerCase() === trimmed.toLowerCase())) {
+      toast.error("Ya existe una sucursal con ese nombre");
+      return;
+    }
+    if (trimmed !== oldName) {
+      setState((s) => {
+        const branchLogos = { ...s.branchLogos };
+        if (oldName in branchLogos) {
+          branchLogos[trimmed] = branchLogos[oldName];
+          delete branchLogos[oldName];
+        }
+        const ns: AppState = {
+          ...s,
+          branches: s.branches.map((b) => (b === oldName ? trimmed : b)),
+          branchLogos,
+          users: s.users.map((u) => (u.branch === oldName ? { ...u, branch: trimmed } : u)),
+          sales: s.sales.map((sale) => (sale.branch === oldName ? { ...sale, branch: trimmed } : sale)),
+          products: s.products.map((p) => ({
+            ...p,
+            variants: p.variants.map((v) => ({
+              ...v,
+              sizes: v.sizes.map((sz) => {
+                if (!sz.stockByBranch || !(oldName in sz.stockByBranch)) return sz;
+                const { [oldName]: qty, ...rest } = sz.stockByBranch;
+                return { ...sz, stockByBranch: { ...rest, [trimmed]: qty } };
+              }),
+            })),
+          })),
+        };
+        saveState(ns);
+        return ns;
+      });
+    }
+    cancelEdit();
+  };
+
+  // Passes validation first (min 1 branch, no users/stock still pointing at it); only once that's
+  // clear does it ask for a final confirmation before actually deleting.
+  const [confirmDeleteBranch, setConfirmDeleteBranch] = useState<string | null>(null);
+
+  const requestDeleteBranch = (name: string) => {
+    if (state.branches.length <= 1) { toast.error("Debe quedar al menos una sucursal"); return; }
+    const count = usersInBranch(name);
+    if (count > 0) { toast.error(`No se puede eliminar: ${count} usuario${count === 1 ? "" : "s"} asignado${count === 1 ? "" : "s"} a esta sucursal`); return; }
+    if (hasStockInBranch(name)) { toast.error("No se puede eliminar: todavía hay stock registrado en esta sucursal"); return; }
+    setConfirmDeleteBranch(name);
+  };
+
+  const deleteBranchNow = () => {
+    if (!confirmDeleteBranch) return;
+    const name = confirmDeleteBranch;
+    setState((s) => {
+      const branchLogos = { ...s.branchLogos };
+      delete branchLogos[name];
+      const ns = { ...s, branches: s.branches.filter((b) => b !== name), branchLogos };
+      saveState(ns);
+      return ns;
+    });
+    setConfirmDeleteBranch(null);
+  };
+
+  return (
+    <div className="flex flex-col h-full">
+      <div className="flex-shrink-0 p-4 flex flex-col gap-3">
+        <p className="text-sm text-muted-foreground">{state.branches.length} sucursales</p>
+        <p className="text-[11px] text-muted-foreground -mt-1">Toca el logo de una sucursal para cambiarlo — se usa en el selector de sucursal al iniciar sesión.</p>
+        <div className="flex items-center gap-2">
+          <Input value={newName} onChange={setNewName} placeholder="Nombre de la nueva sucursal" className="flex-1" />
+          <Btn onClick={addBranch} disabled={!newName.trim()} size="md" className="flex-shrink-0"><Plus size={15} /> Agregar</Btn>
+        </div>
+        <input ref={logoInputRef} type="file" accept="image/*" className="hidden" onChange={(e) => handleLogoFile(e.target.files)} />
+      </div>
+
+      <div className="flex-1 overflow-y-auto scrollbar-visible px-4 pb-4 flex flex-col gap-2">
+        {state.branches.map((b) => {
+          const isEditing = editingBranch === b;
+          const count = usersInBranch(b);
+          return (
+            <div key={b} className="bg-card border border-border rounded-xl px-4 py-3 flex items-center gap-3">
+              {isEditing ? (
+                <>
+                  <input
+                    autoFocus
+                    value={editValue}
+                    onChange={(e) => setEditValue(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === "Enter") confirmRename(b); if (e.key === "Escape") cancelEdit(); }}
+                    className="flex-1 bg-secondary border border-border rounded-lg px-3 py-2 text-sm text-foreground outline-none focus:ring-2 focus:ring-primary/40"
+                  />
+                  <button onClick={() => confirmRename(b)} className="text-emerald-400 hover:text-emerald-300 p-1.5"><Check size={16} /></button>
+                  <button onClick={cancelEdit} className="text-muted-foreground hover:text-foreground p-1.5"><X size={16} /></button>
+                </>
+              ) : (
+                <>
+                  <button onClick={() => triggerLogoUpload(b)} title="Cambiar logo de sucursal"
+                    className="relative w-9 h-9 rounded-lg overflow-hidden bg-secondary border border-border flex items-center justify-center flex-shrink-0 group">
+                    {state.branchLogos?.[b] ? (
+                      <img src={state.branchLogos[b]} alt={b} className="w-full h-full object-cover" />
+                    ) : (
+                      <Warehouse size={16} className="text-muted-foreground" />
+                    )}
+                    <div className="absolute inset-0 bg-black/50 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
+                      {uploadingBranch === b ? <Loader2 size={12} className="text-white animate-spin" /> : <ImageIcon size={12} className="text-white" />}
+                    </div>
+                  </button>
+                  <span className="flex-1 font-semibold text-sm text-foreground"><BranchLabel branch={b} /></span>
+                  <span className="text-xs text-muted-foreground flex-shrink-0">{count} usuario{count === 1 ? "" : "s"}</span>
+                  <button onClick={() => startEdit(b)} className="text-muted-foreground hover:text-foreground p-1.5 flex-shrink-0"><Edit2 size={14} /></button>
+                  <button onClick={() => requestDeleteBranch(b)} className="text-muted-foreground hover:text-red-400 p-1.5 flex-shrink-0"><Trash2 size={14} /></button>
+                </>
+              )}
+            </div>
+          );
+        })}
+      </div>
+
+      <Modal open={!!confirmDeleteBranch} onClose={() => setConfirmDeleteBranch(null)} title="Eliminar sucursal">
+        {confirmDeleteBranch && (
+          <div className="p-5 flex flex-col gap-4">
+            <p className="text-sm text-foreground">
+              ¿Seguro que quieres eliminar <span className="font-semibold">"{confirmDeleteBranch}"</span>? Esta acción no se puede deshacer.
+            </p>
+            <div className="flex gap-3">
+              <Btn onClick={() => setConfirmDeleteBranch(null)} variant="secondary" className="flex-1">Cancelar</Btn>
+              <Btn onClick={deleteBranchNow} variant="danger" className="flex-1"><Trash2 size={15} /> Eliminar</Btn>
+            </div>
+          </div>
+        )}
       </Modal>
     </div>
   );
@@ -2408,16 +3690,50 @@ const UsersView = () => {
 
 // ─── HEADER ───────────────────────────────────────────────────────────────────
 
-const Header = ({ user, view, onLogout }: { user: User; view: View; onLogout: () => void }) => {
+const Header = ({ user, view, onLogout, onChangeBranch }: { user: User; view: View; onLogout: () => void; onChangeBranch?: (b: string) => void }) => {
+  const { state } = useApp();
   const viewTitles: Record<View, string> = {
-    pos: "Punto de Venta", products: "Productos", inventory: "Inventario",
+    pos: "Punto de Venta", inventory: "Inventario",
     history: "Historial de Ventas", users: "Usuarios",
+    commissions: "Comisiones", branches: "Sucursales",
   };
+  const [branchOpen, setBranchOpen] = useState(false);
   return (
-    <header className="flex-shrink-0 flex items-center justify-between px-4 py-3 bg-card/80 backdrop-blur-lg border-b border-border lg:pl-60 xl:pl-64">
+    <header className="relative z-30 flex-shrink-0 flex items-center justify-between px-4 py-3 bg-card/80 backdrop-blur-lg border-b border-border lg:pl-60 xl:pl-64">
       <div>
         <h2 className="font-bold text-sm text-foreground">{viewTitles[view]}</h2>
-        <p className="text-xs text-muted-foreground">{user.branch}</p>
+        {onChangeBranch ? (
+          <div
+            className="relative inline-block mt-1"
+            onBlur={(e) => { if (!e.currentTarget.contains(e.relatedTarget as Node)) setBranchOpen(false); }}
+          >
+            <button
+              type="button"
+              onClick={() => setBranchOpen((o) => !o)}
+              title="Cambiar sucursal"
+              className="flex items-center gap-1.5 bg-secondary border border-border rounded-lg pl-2.5 pr-2 py-1 text-xs font-semibold outline-none cursor-pointer hover:border-primary/40 focus:border-primary/50 transition-colors"
+            >
+              <BranchLabel branch={user.branch} />
+              <ChevronDown size={11} className="text-muted-foreground" />
+            </button>
+            {branchOpen && (
+              <div className="absolute z-20 left-0 mt-1 min-w-[9.5rem] bg-card border border-border rounded-lg shadow-lg py-1 overflow-hidden">
+                {state.branches.map((b) => (
+                  <button
+                    key={b}
+                    type="button"
+                    onClick={() => { onChangeBranch(b); setBranchOpen(false); }}
+                    className="w-full text-left px-3 py-1.5 text-xs font-semibold hover:bg-secondary transition-colors"
+                  >
+                    <BranchLabel branch={b} />
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        ) : (
+          <p className="text-xs text-muted-foreground"><BranchLabel branch={user.branch} /></p>
+        )}
       </div>
       <div className="flex items-center gap-2.5">
         <div className="hidden sm:flex flex-col items-end">
@@ -2436,26 +3752,42 @@ const Header = ({ user, view, onLogout }: { user: User; view: View; onLogout: ()
 // ─── APP PROVIDER + ROOT ──────────────────────────────────────────────────────
 
 const AppProvider = ({ children }: { children: React.ReactNode }) => {
-  const [state, setState] = useState<AppState>(loadState);
-  const [currentUser, setCurrentUser] = useState<User | null>(() => {
-    try {
-      const saved = localStorage.getItem(AUTH_KEY);
-      if (saved) {
-        const { id } = JSON.parse(saved);
-        return loadState().users.find((u) => u.id === id && u.active) ?? null;
-      }
-    } catch {}
-    return null;
-  });
+  const [state, setState] = useState<AppState | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [currentUser, setCurrentUser] = useState<User | null>(null);
 
-  const login = (email: string, pw: string) => {
-    const u = state.users.find((u) => u.email === email && u.password === pw && u.active);
-    if (u) {
-      setCurrentUser(u);
-      localStorage.setItem(AUTH_KEY, JSON.stringify({ id: u.id }));
-      return true;
-    }
-    return false;
+  const boot = () => {
+    setLoadError(null);
+    loadState()
+      .then((s) => {
+        setState(s);
+        try {
+          const saved = localStorage.getItem(AUTH_KEY);
+          if (saved) {
+            const { id } = JSON.parse(saved);
+            setCurrentUser(s.users.find((u) => u.id === id && u.active) ?? null);
+          }
+        } catch {}
+      })
+      .catch((err) => setLoadError(err instanceof Error ? err.message : "Error al cargar la información"));
+  };
+
+  useEffect(() => { boot(); }, []);
+
+  const login = async (username: string, pw: string) => {
+    if (!state) return false;
+    const res = await fetch("/api/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username, password: pw }),
+    });
+    if (!res.ok) return false;
+    const { userId } = await res.json();
+    const u = state.users.find((u) => u.id === userId);
+    if (!u) return false;
+    setCurrentUser(u);
+    localStorage.setItem(AUTH_KEY, JSON.stringify({ id: u.id }));
+    return true;
   };
 
   const logout = () => {
@@ -2463,8 +3795,39 @@ const AppProvider = ({ children }: { children: React.ReactNode }) => {
     localStorage.removeItem(AUTH_KEY);
   };
 
+  // Ctx expects a plain AppState setter; `state` is only nullable during the initial load,
+  // which happens before any of this is ever called (guarded by the early returns below).
+  const updateState: React.Dispatch<React.SetStateAction<AppState>> = (update) => {
+    setState((prev) => {
+      if (!prev) return prev;
+      return typeof update === "function" ? (update as (s: AppState) => AppState)(prev) : update;
+    });
+  };
+
+  if (loadError) {
+    return (
+      <div className="min-h-screen flex flex-col items-center justify-center gap-4 p-6 text-center bg-background">
+        <AlertCircle size={40} className="text-red-400" />
+        <div>
+          <p className="font-semibold text-foreground">No se pudo conectar con la base de datos</p>
+          <p className="text-sm text-muted-foreground mt-1">{loadError}</p>
+        </div>
+        <Btn onClick={boot}>Reintentar</Btn>
+      </div>
+    );
+  }
+
+  if (!state) {
+    return (
+      <div className="min-h-screen flex flex-col items-center justify-center gap-3 bg-background">
+        <Loader2 size={28} className="text-primary animate-spin" />
+        <p className="text-sm text-muted-foreground">Cargando…</p>
+      </div>
+    );
+  }
+
   return (
-    <AppCtx.Provider value={{ state, currentUser, login, logout, setState }}>
+    <AppCtx.Provider value={{ state, currentUser, login, logout, setState: updateState }}>
       {children}
     </AppCtx.Provider>
   );
@@ -2473,23 +3836,31 @@ const AppProvider = ({ children }: { children: React.ReactNode }) => {
 export default function App() {
   const [user, setUser] = useState<User | null>(null);
   const [view, setView] = useState<View>("pos");
+  // Set only by an actual login (LoginView's onLogin) — restoring a session from localStorage on
+  // page load goes through a different path (AppInner's currentUser effect) and deliberately does
+  // NOT set this, so refreshing an already-picked seller session doesn't re-prompt every time.
+  const [needsBranchSelect, setNeedsBranchSelect] = useState(false);
 
   return (
     <AppProvider>
-      <AppInner user={user} setUser={setUser} view={view} setView={setView} />
+      <AppInner user={user} setUser={setUser} view={view} setView={setView}
+        needsBranchSelect={needsBranchSelect} setNeedsBranchSelect={setNeedsBranchSelect} />
+      <Toaster richColors position="top-center" />
     </AppProvider>
   );
 }
 
 function AppInner({
-  user, setUser, view, setView,
+  user, setUser, view, setView, needsBranchSelect, setNeedsBranchSelect,
 }: {
   user: User | null;
   setUser: (u: User | null) => void;
   view: View;
   setView: (v: View) => void;
+  needsBranchSelect: boolean;
+  setNeedsBranchSelect: (v: boolean) => void;
 }) {
-  const { currentUser, logout } = useApp();
+  const { state, currentUser, logout, setState } = useApp();
 
   useEffect(() => {
     if (currentUser) setUser(currentUser);
@@ -2499,35 +3870,89 @@ function AppInner({
     logout();
     setUser(null);
     setView("pos");
+    setNeedsBranchSelect(false);
+  };
+
+  const changeBranch = (branch: string) => {
+    if (!user) return;
+    setState((s) => {
+      const ns = { ...s, users: s.users.map((u) => u.id === user.id ? { ...u, branch } : u) };
+      saveState(ns);
+      return ns;
+    });
+    setUser({ ...user, branch });
+  };
+
+  // Sellers pick which branch they're working from right after logging in — a mandatory, once-
+  // per-login modal (no close/backdrop-dismiss) rather than an always-available in-app switcher
+  // like admin's. Changing branches means logging out and back in and choosing again.
+  const handleLogin = (u: User) => {
+    setUser(u);
+    if (u.role === "seller") setNeedsBranchSelect(true);
+  };
+
+  const changeLogo = (logoUrl: string | undefined) => {
+    setState((s) => {
+      const ns = { ...s, logoUrl };
+      saveState(ns);
+      return ns;
+    });
   };
 
   if (!user) {
-    return <LoginView onLogin={setUser} />;
+    return <LoginView onLogin={handleLogin} />;
   }
 
   const VIEW_COMPONENTS: Record<View, React.ReactNode> = {
     pos: <POSView user={user} />,
     inventory: <InventoryView user={user} />,
     history: <HistoryView user={user} />,
+    commissions: user.role === "admin" ? <CommissionsView /> : <EmptyState icon={ShieldCheck} title="Acceso restringido" desc="Solo administradores pueden ver comisiones" />,
     users: user.role === "admin" ? <UsersView /> : <EmptyState icon={ShieldCheck} title="Acceso restringido" desc="Solo administradores pueden gestionar usuarios" />,
+    branches: user.role === "admin" ? <BranchesView /> : <EmptyState icon={ShieldCheck} title="Acceso restringido" desc="Solo administradores pueden gestionar sucursales" />,
   };
 
   const allowedViews = NAV_ITEMS.filter((n) => n.roles.includes(user.role)).map((n) => n.view);
   const safeView = allowedViews.includes(view) ? view : allowedViews[0];
 
   return (
-    <div className="flex h-screen overflow-hidden bg-background">
-      <SideNav view={safeView} setView={setView} role={user.role} user={user} onLogout={handleLogout} />
-      <div className="flex flex-col flex-1 min-w-0 lg:pl-56 xl:pl-56">
-        <Header user={user} view={safeView} onLogout={handleLogout} />
-        <main className="flex-1 overflow-hidden">
-          {VIEW_COMPONENTS[safeView]}
-        </main>
-        <div className="lg:hidden h-16 flex-shrink-0" />
+    <>
+      <div className="flex h-screen overflow-hidden bg-background">
+        <SideNav view={safeView} setView={setView} role={user.role} user={user} onLogout={handleLogout}
+          logoUrl={state.logoUrl} onChangeLogo={user.role === "admin" ? changeLogo : undefined} />
+        <div className="flex flex-col flex-1 min-w-0 lg:pl-56 xl:pl-56">
+          <Header user={user} view={safeView} onLogout={handleLogout} onChangeBranch={user.role === "admin" ? changeBranch : undefined} />
+          <main className="flex-1 overflow-hidden">
+            {VIEW_COMPONENTS[safeView]}
+          </main>
+          <div className="lg:hidden h-16 flex-shrink-0" />
+        </div>
+        <div className="no-print lg:hidden">
+          <BottomNav view={safeView} setView={setView} role={user.role} />
+        </div>
       </div>
-      <div className="no-print">
-        <BottomNav view={safeView} setView={setView} role={user.role} />
-      </div>
-    </div>
+
+      {/* Mandatory, once-per-login branch pick for sellers — no close/backdrop-dismiss. */}
+      <Modal open={user.role === "seller" && needsBranchSelect} onClose={() => {}} title="Selecciona tu sucursal">
+        <div className="p-5 flex flex-col gap-4">
+          <p className="text-xs text-muted-foreground">Elige la sucursal en la que trabajarás durante esta sesión. Para cambiarla más adelante, cierra sesión y vuelve a entrar.</p>
+          <div className="grid grid-cols-2 gap-3">
+            {state.branches.map((b) => (
+              <button key={b} onClick={() => { changeBranch(b); setNeedsBranchSelect(false); }}
+                className="flex flex-col items-center gap-2 p-4 rounded-xl border border-border bg-secondary hover:border-primary/50 hover:bg-accent transition-all">
+                <div className="w-16 h-16 rounded-xl overflow-hidden bg-background border border-border flex items-center justify-center flex-shrink-0">
+                  {state.branchLogos?.[b] ? (
+                    <img src={state.branchLogos[b]} alt={b} className="w-full h-full object-cover" />
+                  ) : (
+                    <Store size={24} className="text-muted-foreground" />
+                  )}
+                </div>
+                <span className="text-sm font-semibold text-center"><BranchLabel branch={b} /></span>
+              </button>
+            ))}
+          </div>
+        </div>
+      </Modal>
+    </>
   );
 }

@@ -1,0 +1,12 @@
+# Dev-mode image: installs dependencies at build time; the source itself is
+# bind-mounted in docker-compose.yml for hot reload, not copied in here.
+FROM node:20-alpine
+
+WORKDIR /app
+
+COPY package.json package-lock.json ./
+RUN npm ci
+
+EXPOSE 5173
+
+CMD ["npm", "run", "dev"]
