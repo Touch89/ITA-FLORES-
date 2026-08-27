@@ -77,3 +77,86 @@ Tailwind v4 via `@tailwindcss/vite` (see [vite.config.ts](vite.config.ts)), with
 `docker compose up -d` starts all three; the app is then reachable at `localhost:5173` same as running `npm run dev` natively — don't run both at once, they'll fight over the port.
 
 **Adding a new npm dependency:** a plain `docker compose up -d --build frontend` is not enough — the anonymous `node_modules` volume from the previous container is reused as-is (stale), so the new package won't be there even though the image rebuilt. Use `docker compose up -d --build --force-recreate -V frontend` (the `-V` renews anonymous volumes) instead.
+
+## To-Do (from 2026-08-27 security/architecture audit)
+
+Ordered by severity. The root problem behind items 1-4 is the same: `/api/state` (GET/PUT in `vite.config.ts`) has no server-side auth at all — every role check in the app is enforced only in the React client and can be bypassed with a direct HTTP request.
+
+- [ ] **Critical — add real server-side auth to `/api/state`.** `POST /api/login` doesn't issue anything the client can prove later; `AppProvider.login` just stashes `{id}` in `localStorage`. Anyone who can reach the dev server can `GET`/`PUT /api/state` with zero credentials. Needs a session (signed cookie or JWT) issued by `/api/login` and verified by the `/api/state` middleware before it touches the DB.
+- [ ] **Critical — close the account-takeover hole in `replaceFullState`.** Because `PUT /api/state` is unauthenticated, a caller can include a `password` field on any user object (e.g. `admin`) and `server/db.mjs`'s `replaceFullState` will hash and store it — or just flip that user's `role` to `"admin"`. Needs to require the caller be authenticated *as* the user being changed (or an admin) before honoring a `password`/`role` change.
+- [ ] **High — validate `PUT /api/state` payloads server-side.** Right now `replaceFullState` trusts the client blob completely (negative prices/stock, arbitrary commission tiers, etc. all get inserted as-is). Add schema/sanity validation before the delete-and-reinsert.
+- [ ] **High — fix the cross-session lost-update race.** `saveInFlight`/`pendingSaveState` in `App.tsx` only serialize saves within one browser tab; two different sellers (or two tabs) saving near-simultaneously can silently clobber each other via the full-table-rewrite (`PUT` last-write-wins), losing a sale or an inventory edit. `confirmSale` also computes new stock from the client's in-memory `state`, so two concurrent sales at the same branch can oversell before either save lands. Needs either per-entity writes or a real optimistic-concurrency check (e.g. version column) instead of whole-DB replace.
+- [ ] **High — stop trusting the upload `Content-Type` header.** `uploadServer()`'s `fileFilter` in `vite.config.ts` only checks the client-supplied mimetype, so an `image/svg+xml` upload can contain `<script>` and serve as stored XSS when opened directly from `/uploads/...`. Validate actual file content (magic bytes) or strip scripts from SVGs, and consider serving `/uploads` with a `Content-Disposition`/CSP that blocks script execution.
+- [ ] **Medium — rate-limit `POST /api/login`.** No attempt limit today; `authenticateUser`'s good practice of not distinguishing "unknown user" from "wrong password" is undermined by unlimited brute-force attempts.
+- [ ] **Medium — remove the hardcoded demo credentials from `LoginView`** (`admin/admin123`, `almacen/almacen123`, `vendedor/vendedor123`, shown directly on the login screen) before any real deployment.
+- [ ] **Medium — upgrade `react-router`** (currently 7.13.0) — `npm audit` flags a high-severity advisory; `npm audit fix --force` resolves it (bumps to 7.18.2+). Most of the underlying CVEs are SSR/RSC-specific and don't apply to this SPA, but the fix is free.
+- [ ] **Medium — don't expose MariaDB/Adminer ports outside local dev.** `docker-compose.yml` publishes `3306`/`8080` to the host with weak example passwords in `.env.example`; fine for a laptop, dangerous if that compose file is ever run on a networked machine with real/default credentials.
+- [ ] **Low — no tests, lint, or typecheck configured.** Worth adding at least a typecheck script given `App.tsx` is ~3100 lines and easy to silently break.
+
+## Guidelines (formerly `guidelines/Guidelines.md`)
+
+Moved here verbatim; it was still the unfilled Figma Make template (no project-specific rules were ever added — the whole thing was commented out) — replace this section once there are real guidelines to record.
+
+```
+**Add your own guidelines here**
+<!--
+
+System Guidelines
+
+Use this file to provide the AI with rules and guidelines you want it to follow.
+This template outlines a few examples of things you can add. You can add your own sections and format it to suit your needs
+
+TIP: More context isn't always better. It can confuse the LLM. Try and add the most important rules you need
+
+# General guidelines
+
+Any general rules you want the AI to follow.
+For example:
+
+* Only use absolute positioning when necessary. Opt for responsive and well structured layouts that use flexbox and grid by default
+* Refactor code as you go to keep code clean
+* Keep file sizes small and put helper functions and components in their own files.
+
+--------------
+
+# Design system guidelines
+Rules for how the AI should make generations look like your company's design system
+
+Additionally, if you select a design system to use in the prompt box, you can reference
+your design system's components, tokens, variables and components.
+For example:
+
+* Use a base font-size of 14px
+* Date formats should always be in the format "Jun 10"
+* The bottom toolbar should only ever have a maximum of 4 items
+* Never use the floating action button with the bottom toolbar
+* Chips should always come in sets of 3 or more
+* Don't use a dropdown if there are 2 or fewer options
+
+You can also create sub sections and add more specific details
+For example:
+
+
+## Button
+The Button component is a fundamental interactive element in our design system, designed to trigger actions or navigate
+users through the application. It provides visual feedback and clear affordances to enhance user experience.
+
+### Usage
+Buttons should be used for important actions that users need to take, such as form submissions, confirming choices,
+or initiating processes. They communicate interactivity and should have clear, action-oriented labels.
+
+### Variants
+* Primary Button
+  * Purpose : Used for the main action in a section or page
+  * Visual Style : Bold, filled with the primary brand color
+  * Usage : One primary button per section to guide users toward the most important action
+* Secondary Button
+  * Purpose : Used for alternative or supporting actions
+  * Visual Style : Outlined with the primary color, transparent background
+  * Usage : Can appear alongside a primary button for less important actions
+* Tertiary Button
+  * Purpose : Used for the least important actions
+  * Visual Style : Text-only with no border, using primary color
+  * Usage : For actions that should be available but not emphasized
+-->
+```
