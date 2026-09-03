@@ -1,0 +1,31 @@
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "useDefineForClassFields": true,
+    "lib": ["ES2020", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "types": ["node", "vite/client"],
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    // Lets tsc actually check server/*.mjs (pulled in transitively via vite.config.ts's imports)
+    // by inferring types from the real JS instead of falling back to `any` for the whole module.
+    "allowJs": true,
+    "jsx": "react-jsx",
+    "strict": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "noFallthroughCasesInSwitch": true,
+    "paths": {
+      "@/*": ["./src/*"]
+    }
+  },
+  // The shadcn/ui scaffold under src/app/components/ui is Figma Make boilerplate that CLAUDE.md
+  // already flags as "mostly unused-by-App.tsx" — excluded so `npm run typecheck` tracks the real
+  // app (App.tsx, main.tsx, vite.config.ts) instead of drowning in errors from code nothing calls.
+  // Re-include a file from there (or the whole folder) once it's actually wired into the app.
+  "include": ["src/app/App.tsx", "src/app/components/figma", "src/main.tsx", "vite.config.ts"],
+  "exclude": ["node_modules", "dist"]
+}

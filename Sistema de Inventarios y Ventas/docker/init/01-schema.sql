@@ -27,11 +27,16 @@ CREATE TABLE IF NOT EXISTS branches (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- Single-row table for app-wide settings that aren't tied to any one entity.
+-- state_version: bumped on every successful PUT /api/state (see replaceFullState in server/db.mjs)
+-- — the optimistic-concurrency check that stops two overlapping saves from silently clobbering
+-- each other. (server/db.mjs also ADD COLUMN IF NOT EXISTS-migrates this into an already-existing
+-- app_settings table, since docker-entrypoint-initdb.d scripts only run against a fresh DB volume.)
 CREATE TABLE IF NOT EXISTS app_settings (
   id                INT PRIMARY KEY DEFAULT 1,
   logo_url          VARCHAR(255) NULL,
   barcode_counter   INT NOT NULL DEFAULT 1000,
-  sale_counter      INT NOT NULL DEFAULT 0
+  sale_counter      INT NOT NULL DEFAULT 0,
+  state_version     INT NOT NULL DEFAULT 0
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- Commission tiers: whichever bracket a seller's total sales for the chosen

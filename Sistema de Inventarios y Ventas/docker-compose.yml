@@ -9,7 +9,11 @@ services:
       MARIADB_USER: ${DB_USER}
       MARIADB_PASSWORD: ${DB_PASSWORD}
     ports:
-      - "${DB_PORT:-3306}:3306"
+      # Bound to loopback only — this is dev/debug access to the DB (a local client, `mariadb`
+      # CLI), not something the app needs from outside the container (the frontend service reaches
+      # mariadb over the internal docker network via DB_HOST, not this published port). Publishing
+      # it on 0.0.0.0 would put a DB with example/weak .env passwords on the network.
+      - "127.0.0.1:${DB_PORT:-3306}:3306"
     volumes:
       - db_data:/var/lib/mysql
       - ./docker/init:/docker-entrypoint-initdb.d:ro
@@ -25,7 +29,9 @@ services:
     container_name: ita-flores-adminer
     restart: unless-stopped
     ports:
-      - "${ADMINER_PORT:-8080}:8080"
+      # Same reasoning as mariadb's port above — a DB admin UI has no business being reachable from
+      # outside the machine running it.
+      - "127.0.0.1:${ADMINER_PORT:-8080}:8080"
     depends_on:
       mariadb:
         condition: service_healthy
@@ -46,6 +52,7 @@ services:
       DB_NAME: ${DB_NAME}
       DB_USER: ${DB_USER}
       DB_PASSWORD: ${DB_PASSWORD}
+      SESSION_SECRET: ${SESSION_SECRET}
     depends_on:
       mariadb:
         condition: service_healthy

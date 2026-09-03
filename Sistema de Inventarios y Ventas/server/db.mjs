@@ -2,6 +2,19 @@
 // Mounted into Vite's dev server as middleware (see vite.config.ts) — GET/PUT /api/state.
 import mysql from 'mysql2/promise'
 import bcrypt from 'bcryptjs'
+import { validateState, ValidationError } from './validateState.mjs'
+
+export { ValidationError }
+
+// Thrown when an authenticated caller (see server/session.mjs) tries something their session
+// doesn't authorize — distinct from a plain Error so the API layer (vite.config.ts) can answer
+// 403 instead of 500.
+export class ForbiddenError extends Error {}
+
+// Thrown when a save's `stateVersion` no longer matches the DB's — someone else's save landed
+// first. Distinct from a plain Error so the API layer can answer 409 instead of 500/silently
+// overwriting. See the version check in replaceFullState below.
+export class ConflictError extends Error {}
 
 let pool
 
@@ -21,6 +34,18 @@ function getPool() {
   return pool
 }
 
+// Self-migrating: `docker-entrypoint-initdb.d` (01-schema.sql) only runs against a brand-new DB
+// volume, so a column added there never reaches an already-existing dev database on its own (see
+// the Docker section of CLAUDE.md). Running this once per server process means state_version shows
+// up on both a fresh `docker compose up` and an existing volume, no manual ALTER TABLE needed.
+let schemaEnsured = null
+function ensureSchema(db) {
+  if (!schemaEnsured) {
+    schemaEnsured = db.query('ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS state_version INT NOT NULL DEFAULT 0')
+  }
+  return schemaEnsured
+}
+
 // "2026-07-20T10:31:00.000Z" or "2026-07-08T10:30:00" -> "2026-07-20 10:31:00"
 // (no timezone math — treated as a literal wall-clock stamp, matching how the app already handles dates)
 function toMysqlDatetime(isoStr) {
@@ -30,6 +55,7 @@ function toMysqlDatetime(isoStr) {
 
 export async function getFullState() {
   const db = getPool()
+  await ensureSchema(db)
   const [[users], [tiers], [products], [images], [variants], [sizes], [sales], [items], [settingsRows], [branches], [cortes]] = await Promise.all([
     db.query('SELECT * FROM users ORDER BY created_at'),
     db.query('SELECT * FROM commission_tiers ORDER BY min_amount'),
@@ -43,7 +69,7 @@ export async function getFullState() {
     db.query('SELECT name, logo_url FROM branches ORDER BY sort_order, name'),
     db.query('SELECT * FROM cortes ORDER BY performed_at DESC'),
   ])
-  const settings = settingsRows[0] || { logo_url: null, barcode_counter: 1000, sale_counter: 0 }
+  const settings = settingsRows[0] || { logo_url: null, barcode_counter: 1000, sale_counter: 0, state_version: 0 }
 
   const sizesByVariant = new Map()
   for (const sz of sizes) {
@@ -127,21 +153,69 @@ export async function getFullState() {
     logoUrl: settings.logo_url ?? undefined,
     barcodeCounter: settings.barcode_counter,
     saleCounter: settings.sale_counter,
+    stateVersion: settings.state_version ?? 0,
   }
 }
 
-export async function replaceFullState(state) {
+// `caller` is the { id, role } embedded in the requester's session cookie (see server/session.mjs
+// / vite.config.ts's requireSession) — required so this can tell "an admin edited someone" apart
+// from "someone edited themselves" apart from "someone edited someone else", since PUT /api/state
+// is otherwise just a full-table replace with no per-field ownership of its own.
+export async function replaceFullState(state, caller) {
+  // Pure structural/sanity checks (no DB needed) — reject before ever taking a connection out of
+  // the pool, so a malformed payload can't tie one up.
+  validateState(state)
+
   const db = getPool()
+  await ensureSchema(db)
   const conn = await db.getConnection()
   try {
     await conn.beginTransaction()
     await conn.query('SET FOREIGN_KEY_CHECKS=0')
 
+    // Optimistic-concurrency check: PUT /api/state is a full-table replace with no per-entity
+    // granularity, so this row's version is the only thing that can tell "I'm overwriting what I
+    // just read" apart from "I'm overwriting someone else's save that landed after I loaded my
+    // copy". FOR UPDATE locks the settings row for the rest of this transaction, so two concurrent
+    // saves against the same version genuinely serialize here instead of both reading "not stale
+    // yet" and both proceeding — the second one blocks until the first commits, then correctly sees
+    // itself as stale. Without this, two sellers finishing a sale near-simultaneously (or a sale
+    // racing an inventory edit) could silently clobber each other via last-write-wins; with it, the
+    // loser gets a clean 409 instead of a silently lost sale or oversold stock.
+    const [[settingsRow]] = await conn.query('SELECT state_version FROM app_settings WHERE id = 1 FOR UPDATE')
+    const currentVersion = settingsRow?.state_version ?? 0
+    if (state.stateVersion !== currentVersion) {
+      throw new ConflictError('Los datos cambiaron desde que los cargaste (alguien más guardó primero). Recarga la página e intenta de nuevo.')
+    }
+    const newVersion = currentVersion + 1
+
     // The client never receives password hashes (see getFullState), so a user object round-tripped
     // through GET -> edit -> PUT has no `password` field unless the caller is actively setting a new
     // one. Capture the existing hashes first so the delete-and-reinsert below doesn't wipe them.
-    const [existingUsers] = await conn.query('SELECT id, password FROM users')
+    const [existingUsers] = await conn.query('SELECT id, password, role FROM users')
     const existingPasswordById = new Map(existingUsers.map((u) => [u.id, u.password]))
+    const existingRoleById = new Map(existingUsers.map((u) => [u.id, u.role]))
+
+    // Authorization check, up front, before anything is touched: PUT /api/state carries the whole
+    // users table on every save (not just what the caller meant to change), so this is the one
+    // place that can tell a real edit from a forged one. Only an admin may create a user or change
+    // anyone's role (role must NEVER be self-service — that's exactly the escalation this closes:
+    // a non-admin flipping their own `role` to "admin"). A password may be changed by an admin or
+    // by the account's own owner, since that's the one self-service case that's actually safe.
+    for (const u of state.users) {
+      const existingRole = existingRoleById.get(u.id)
+      const isNewUser = existingRole === undefined
+      const roleChanged = !isNewUser && u.role !== existingRole
+      if ((isNewUser || roleChanged) && caller.role !== 'admin') {
+        throw new ForbiddenError(
+          isNewUser ? 'Solo un administrador puede crear usuarios.' : 'Solo un administrador puede cambiar el rol de un usuario.'
+        )
+      }
+      const newPlainPassword = (u.password || '').trim()
+      if (newPlainPassword && caller.role !== 'admin' && caller.id !== u.id) {
+        throw new ForbiddenError('Solo puedes cambiar tu propia contraseña, o ser administrador para cambiar la de alguien más.')
+      }
+    }
 
     for (const table of ['sale_items', 'sales', 'variant_sizes', 'product_variants', 'product_images', 'products', 'commission_tiers', 'users', 'branches', 'cortes']) {
       await conn.query(`DELETE FROM ${table}`)
@@ -210,12 +284,13 @@ export async function replaceFullState(state) {
     }
 
     await conn.query(
-      'INSERT INTO app_settings (id, logo_url, barcode_counter, sale_counter) VALUES (1, ?, ?, ?) ON DUPLICATE KEY UPDATE logo_url=VALUES(logo_url), barcode_counter=VALUES(barcode_counter), sale_counter=VALUES(sale_counter)',
-      [state.logoUrl ?? null, state.barcodeCounter, state.saleCounter]
+      'INSERT INTO app_settings (id, logo_url, barcode_counter, sale_counter, state_version) VALUES (1, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE logo_url=VALUES(logo_url), barcode_counter=VALUES(barcode_counter), sale_counter=VALUES(sale_counter), state_version=VALUES(state_version)',
+      [state.logoUrl ?? null, state.barcodeCounter, state.saleCounter, newVersion]
     )
 
     await conn.query('SET FOREIGN_KEY_CHECKS=1')
     await conn.commit()
+    return newVersion
   } catch (err) {
     await conn.rollback()
     throw err
@@ -224,14 +299,16 @@ export async function replaceFullState(state) {
   }
 }
 
-// Verifies username+password against the stored bcrypt hash. Returns the user's id on success,
-// or null on any failure (unknown username, wrong password, inactive account) — deliberately not
-// distinguishing which, so the login form can't be used to enumerate valid usernames.
+// Verifies username+password against the stored bcrypt hash. Returns { id, role } on success, or
+// null on any failure (unknown username, wrong password, inactive account) — deliberately not
+// distinguishing which, so the login form can't be used to enumerate valid usernames. The role is
+// embedded in the session cookie (see server/session.mjs) so per-request auth checks don't need a
+// DB round trip just to know who's asking.
 export async function authenticateUser(username, plainPassword) {
   const db = getPool()
-  const [rows] = await db.query('SELECT id, password, active FROM users WHERE username = ?', [username])
+  const [rows] = await db.query('SELECT id, password, role, active FROM users WHERE username = ?', [username])
   const user = rows[0]
   if (!user || !user.active) return null
   const matches = await bcrypt.compare(plainPassword || '', user.password)
-  return matches ? user.id : null
+  return matches ? { id: user.id, role: user.role } : null
 }

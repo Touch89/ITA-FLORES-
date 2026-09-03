@@ -126,11 +126,15 @@ interface Corte {
   cashTotal: number;
   cardTotal: number;
   sales: CorteSaleSummary[];
-  // Snapshotted at cut time (not re-derived later) — same reasoning as `sales` above: editing the
-  // day's fondo or adding a movimiento after this corte was made shouldn't rewrite its history.
-  fondoAmount: number;
-  entradas: number;
-  salidas: number;
+  // Meant to be snapshotted at cut time (not re-derived later) — same reasoning as `sales` above:
+  // editing the day's fondo or adding a movimiento after this corte was made shouldn't rewrite its
+  // history. Optional because that wiring was never finished: `cajaFondos`/`cajaMovimientos` exist
+  // on AppState but nothing in the app currently reads or writes them (no fondo/movimiento UI
+  // exists yet), and DailySalesTab's doCorte() doesn't populate these — so today every real Corte
+  // is missing them. Revisit once the caja-fondo feature is actually built.
+  fondoAmount?: number;
+  entradas?: number;
+  salidas?: number;
 }
 
 // One opening cash float per branch per calendar day ("YYYY-MM-DD"), freely editable all day (no
@@ -171,6 +175,10 @@ interface AppState {
   logoUrl?: string;
   barcodeCounter: number;
   saleCounter: number;
+  // Optimistic-concurrency counter from the server (see server/db.mjs's replaceFullState) — read
+  // by loadState()/performSave() only (module-level `lastKnownVersion`, not threaded through
+  // React state), present here mainly so the shape of what GET /api/state returns is honest.
+  stateVersion?: number;
 }
 
 // ─── CONSTANTS ────────────────────────────────────────────────────────────────
@@ -232,13 +240,35 @@ const STORE = {
 
 const AUTH_KEY = "moda_auth_v2";
 
+// Thrown by loadState() specifically for a 401 (no/expired session cookie) so callers can tell
+// "not logged in" apart from a real connectivity/server error.
+class UnauthorizedError extends Error {}
+
+// The server's optimistic-concurrency counter (see replaceFullState in server/db.mjs) — tracked
+// per browser tab, outside React state, so every performSave() call (including ones queued while
+// an earlier save was still in flight) always sends the version this tab most recently confirmed,
+// without having to thread `stateVersion` through the ~30 setState-then-saveState call sites.
+let lastKnownVersion = 0;
+
 const loadState = async (): Promise<AppState> => {
   const res = await fetch("/api/state");
+  if (res.status === 401) throw new UnauthorizedError("No autenticado");
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
     throw new Error(body.error || "No se pudo cargar la información desde la base de datos");
   }
-  return res.json();
+  const s: AppState = await res.json();
+  lastKnownVersion = s.stateVersion ?? 0;
+  return s;
+};
+
+// Placeholder shown only while the login screen is up (no session yet, so /api/state 401s and
+// there's no real data to show) — nothing reads from this beyond LoginView's own optional
+// `state.logoUrl` branding, since every other view is only reachable once a real login replaces it.
+const EMPTY_STATE: AppState = {
+  users: [], products: [], sales: [], commissionTiers: [], branches: [],
+  branchLogos: {}, cortes: [], cajaFondos: [], cajaMovimientos: [],
+  logoUrl: undefined, barcodeCounter: 1000, saleCounter: 0,
 };
 
 // PUT /api/state rewrites every table on each call, so two overlapping requests can conflict
@@ -251,17 +281,41 @@ let pendingSaveState: AppState | null = null;
 
 const performSave = (s: AppState): Promise<void> =>
   fetch("/api/state", {
+    // Always send the last version *this tab* confirmed, not whatever happens to be sitting on `s`
+    // (which could be stale if the caller's closure captured state from before the last save
+    // resolved) — see the `lastKnownVersion` comment above.
     method: "PUT",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(s),
+    body: JSON.stringify({ ...s, stateVersion: lastKnownVersion }),
   })
     .then(async (res) => {
+      // Session cookie expired (8h) mid-shift: every further save would silently 401, so force a
+      // reload now rather than leave the user editing against a session that no longer sticks —
+      // boot()'s 401 handling then takes them cleanly back to the login screen.
+      if (res.status === 401) {
+        localStorage.removeItem(AUTH_KEY);
+        window.location.reload();
+        return;
+      }
+      // Someone else's save landed first (server/db.mjs's version check) — this save was rejected
+      // rather than silently overwriting theirs (or, for a sale, silently overselling stock both
+      // of them thought was available). There's no clean way to patch just this one change into
+      // fresh server state from here, so reload: it's a jarring UX for whatever the user was doing,
+      // but far better than the alternative of one of the two changes vanishing without a trace.
+      if (res.status === 409) {
+        const body = await res.json().catch(() => ({}));
+        toast.error(body.error || "Los datos cambiaron en otro dispositivo. Recargando…");
+        setTimeout(() => window.location.reload(), 1500);
+        return;
+      }
       if (!res.ok) {
         const body = await res.json().catch(() => ({}));
         throw new Error(body.error || "Error al guardar en la base de datos");
       }
+      const body = await res.json().catch(() => ({}));
+      if (typeof body.stateVersion === "number") lastKnownVersion = body.stateVersion;
     })
-    .catch((err) => toast.error(err instanceof Error ? err.message : "Error al guardar los cambios"));
+    .catch((err) => { toast.error(err instanceof Error ? err.message : "Error al guardar los cambios"); });
 
 const saveState = (s: AppState) => {
   if (saveInFlight) {
@@ -283,7 +337,9 @@ const saveState = (s: AppState) => {
 interface Ctx {
   state: AppState;
   currentUser: User | null;
-  login: (username: string, pw: string) => Promise<boolean>;
+  // Returns the logged-in User on success (so callers don't need `state.users` to already be
+  // loaded — it isn't, pre-login) or null on failure.
+  login: (username: string, pw: string) => Promise<User | null>;
   logout: () => void;
   setState: React.Dispatch<React.SetStateAction<AppState>>;
 }
@@ -318,6 +374,11 @@ const uploadImage = async (file: File, category: UploadCategory, previousUrl?: s
   formData.append("file", file);
   if (previousUrl) formData.append("previousUrl", previousUrl);
   const res = await fetch(`/api/upload/${category}`, { method: "POST", body: formData });
+  if (res.status === 401) {
+    localStorage.removeItem(AUTH_KEY);
+    window.location.reload();
+    throw new Error("Sesión expirada");
+  }
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || "Error al subir la imagen");
   return data.url as string;
@@ -371,7 +432,7 @@ const BranchLabel = ({ branch, className = "" }: { branch: string; className?: s
 const Btn = ({
   children, onClick, variant = "primary", size = "md", className = "", disabled = false, type = "button",
 }: {
-  children: React.ReactNode; onClick?: () => void; variant?: "primary"|"secondary"|"ghost"|"danger"|"outline";
+  children: React.ReactNode; onClick?: (e: React.MouseEvent<HTMLButtonElement>) => void; variant?: "primary"|"secondary"|"ghost"|"danger"|"outline";
   size?: "sm"|"md"|"lg"; className?: string; disabled?: boolean; type?: "button"|"submit";
 }) => {
   const base = "inline-flex items-center justify-center gap-2 rounded-lg font-medium transition-all duration-150 select-none";
@@ -396,10 +457,10 @@ const Btn = ({
 };
 
 const Input = ({
-  label, value, onChange, placeholder, type = "text", className = "", icon, min, step, inputMode, onFocus,
+  label, value, onChange, placeholder, type = "text", className = "", icon, min, max, step, inputMode, onFocus,
 }: {
   label?: string; value: string | number; onChange: (v: string) => void; placeholder?: string;
-  type?: string; className?: string; icon?: React.ReactNode; min?: number; step?: number;
+  type?: string; className?: string; icon?: React.ReactNode; min?: number; max?: number; step?: number;
   inputMode?: React.HTMLAttributes<HTMLInputElement>["inputMode"]; onFocus?: React.FocusEventHandler<HTMLInputElement>;
 }) => (
   <div className={`flex flex-col gap-1.5 ${className}`}>
@@ -413,6 +474,7 @@ const Input = ({
         onFocus={onFocus}
         placeholder={placeholder}
         min={min}
+        max={max}
         step={step}
         inputMode={inputMode}
         className={`w-full bg-secondary border border-border rounded-lg px-3 py-2.5 text-sm text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-2 focus:ring-primary/40 focus:border-primary/50 transition-all ${icon ? "pl-9" : ""}`}
@@ -806,8 +868,8 @@ const LoginView = ({ onLogin }: { onLogin: (u: User) => void }) => {
     setError("");
     setLoggingIn(true);
     try {
-      if (await login(username, pw)) {
-        const u = state.users.find((u) => u.username === username && u.active)!;
+      const u = await login(username, pw);
+      if (u) {
         onLogin(u);
       } else {
         setError("Credenciales incorrectas o cuenta inactiva.");
@@ -859,21 +921,6 @@ const LoginView = ({ onLogin }: { onLogin: (u: User) => void }) => {
             )}
             <Btn type="submit" size="lg" disabled={loggingIn} className="mt-1 w-full">{loggingIn ? "Entrando…" : "Entrar"}</Btn>
           </form>
-          <div className="mt-5 pt-4 border-t border-border">
-            <p className="text-xs text-muted-foreground text-center mb-3">Cuentas de demostración:</p>
-            <div className="flex flex-col gap-2">
-              {[
-                { username:"admin", pw:"admin123", role:"Administrador" },
-                { username:"almacen", pw:"almacen123", role:"Jefe Almacén" },
-                { username:"vendedor", pw:"vendedor123", role:"Vendedor" },
-              ].map((d) => (
-                <button key={d.username} onClick={() => { setUsername(d.username); setPw(d.pw); }} className="text-left text-xs bg-secondary hover:bg-accent border border-border rounded-lg px-3 py-2 transition-colors">
-                  <span className="font-semibold text-foreground">{d.role}</span>
-                  <span className="text-muted-foreground ml-2">{d.username}</span>
-                </button>
-              ))}
-            </div>
-          </div>
         </div>
       </div>
     </div>
@@ -2221,7 +2268,6 @@ const InventoryView = ({ user }: { user: User }) => {
                   onClick={() => {
                     if (editing || form.sizeSystem === sys.value) return;
                     setForm((f) => ({ ...f, sizeSystem: sys.value, variants: [] }));
-                    setVSize(sys.sizes[0]);
                     setExpandedVariantId(null);
                   }}
                   className={`flex flex-col items-center gap-1 px-3 py-3 rounded-xl border text-center transition-all ${
@@ -3755,9 +3801,13 @@ const AppProvider = ({ children }: { children: React.ReactNode }) => {
   const [state, setState] = useState<AppState | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [currentUser, setCurrentUser] = useState<User | null>(null);
+  // True once we know for sure there's no valid session (a 401 from /api/state) — distinct from
+  // `state === null`, which also covers "haven't heard back yet" (still show the loading spinner).
+  const [authRequired, setAuthRequired] = useState(false);
 
   const boot = () => {
     setLoadError(null);
+    setAuthRequired(false);
     loadState()
       .then((s) => {
         setState(s);
@@ -3769,34 +3819,52 @@ const AppProvider = ({ children }: { children: React.ReactNode }) => {
           }
         } catch {}
       })
-      .catch((err) => setLoadError(err instanceof Error ? err.message : "Error al cargar la información"));
+      .catch((err) => {
+        if (err instanceof UnauthorizedError) {
+          localStorage.removeItem(AUTH_KEY);
+          setAuthRequired(true);
+          return;
+        }
+        setLoadError(err instanceof Error ? err.message : "Error al cargar la información");
+      });
   };
 
   useEffect(() => { boot(); }, []);
 
-  const login = async (username: string, pw: string) => {
-    if (!state) return false;
+  // /api/state is now session-gated, so there's no AppState to look a username up in until after
+  // a successful /api/login — fetch the real state as part of logging in instead of before it.
+  const login = async (username: string, pw: string): Promise<User | null> => {
     const res = await fetch("/api/login", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ username, password: pw }),
     });
-    if (!res.ok) return false;
+    if (!res.ok) return null;
     const { userId } = await res.json();
-    const u = state.users.find((u) => u.id === userId);
-    if (!u) return false;
-    setCurrentUser(u);
-    localStorage.setItem(AUTH_KEY, JSON.stringify({ id: u.id }));
-    return true;
+    try {
+      const freshState = await loadState();
+      const u = freshState.users.find((u) => u.id === userId && u.active);
+      if (!u) return null;
+      setState(freshState);
+      setAuthRequired(false);
+      setCurrentUser(u);
+      localStorage.setItem(AUTH_KEY, JSON.stringify({ id: u.id }));
+      return u;
+    } catch {
+      return null;
+    }
   };
 
   const logout = () => {
+    fetch("/api/logout", { method: "POST" }).catch(() => {});
     setCurrentUser(null);
+    setState(null);
+    setAuthRequired(true);
     localStorage.removeItem(AUTH_KEY);
   };
 
-  // Ctx expects a plain AppState setter; `state` is only nullable during the initial load,
-  // which happens before any of this is ever called (guarded by the early returns below).
+  // Ctx expects a plain AppState setter; `state` is only nullable pre-login, before any of this
+  // is ever called (every mutation handler lives behind a logged-in view).
   const updateState: React.Dispatch<React.SetStateAction<AppState>> = (update) => {
     setState((prev) => {
       if (!prev) return prev;
@@ -3817,7 +3885,10 @@ const AppProvider = ({ children }: { children: React.ReactNode }) => {
     );
   }
 
-  if (!state) {
+  // Still waiting to hear back from the very first /api/state (don't yet know if there's a valid
+  // session or not) — once that resolves either way we always fall through to the provider below,
+  // with EMPTY_STATE standing in for real data until a login actually loads it.
+  if (!state && !authRequired) {
     return (
       <div className="min-h-screen flex flex-col items-center justify-center gap-3 bg-background">
         <Loader2 size={28} className="text-primary animate-spin" />
@@ -3827,7 +3898,7 @@ const AppProvider = ({ children }: { children: React.ReactNode }) => {
   }
 
   return (
-    <AppCtx.Provider value={{ state, currentUser, login, logout, setState: updateState }}>
+    <AppCtx.Provider value={{ state: state ?? EMPTY_STATE, currentUser, login, logout, setState: updateState }}>
       {children}
     </AppCtx.Provider>
   );
