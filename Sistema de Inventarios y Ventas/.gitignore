@@ -5,3 +5,6 @@ dist/
 # Uploaded images (dev upload server) — keep the folders, not their contents
 public/uploads/*/*
 !public/uploads/*/.gitkeep
+
+# Production uploads folder (server/prod.mjs UPLOADS_DIR default) — lives in a Docker volume on the server
+uploads/

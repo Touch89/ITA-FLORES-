@@ -6,6 +6,7 @@
   "scripts": {
     "build": "vite build",
     "dev": "vite",
+    "start": "node server/prod.mjs",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

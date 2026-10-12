@@ -1,0 +1,50 @@
+# Production stack for the VPS:
+#   docker compose -f docker-compose.prod.yml up -d --build
+# Same .env as development (DB_*, SESSION_SECRET), plus optional APP_PORT. Only the app is
+# published, and only on 127.0.0.1 — the reverse proxy (Caddy) in front of it handles 80/443 and
+# HTTPS. MariaDB isn't published at all, and there's no adminer (use an SSH tunnel + the dev compose
+# file locally, or `docker compose -f docker-compose.prod.yml exec mariadb mariadb ...` on the VPS).
+# Note: Docker bypasses ufw for published ports, which is why the binding must stay on 127.0.0.1.
+services:
+  mariadb:
+    image: mariadb:11
+    container_name: ita-flores-db
+    restart: unless-stopped
+    environment:
+      MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
+      MARIADB_DATABASE: ${DB_NAME}
+      MARIADB_USER: ${DB_USER}
+      MARIADB_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - db_data:/var/lib/mysql
+      - ./docker/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ita-flores-app
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${APP_PORT:-3000}:3000"
+    volumes:
+      - uploads:/app/uploads
+    environment:
+      DB_HOST: mariadb
+      DB_NAME: ${DB_NAME}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      SESSION_SECRET: ${SESSION_SECRET}
+    depends_on:
+      mariadb:
+        condition: service_healthy
+
+volumes:
+  db_data:
+  uploads:
