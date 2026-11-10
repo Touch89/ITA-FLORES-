@@ -3956,7 +3956,7 @@ function AppInner({
 
   // Sellers pick which branch they're working from right after logging in — a mandatory, once-
   // per-login modal (no close/backdrop-dismiss) rather than an always-available in-app switcher
-  // like admin's. Changing branches means logging out and back in and choosing again.
+  // like admin's/warehouse's. Changing branches means logging out and back in and choosing again.
   const handleLogin = (u: User) => {
     setUser(u);
     if (u.role === "seller") setNeedsBranchSelect(true);
@@ -3992,7 +3992,7 @@ function AppInner({
         <SideNav view={safeView} setView={setView} role={user.role} user={user} onLogout={handleLogout}
           logoUrl={state.logoUrl} onChangeLogo={user.role === "admin" ? changeLogo : undefined} />
         <div className="flex flex-col flex-1 min-w-0 lg:pl-56 xl:pl-56">
-          <Header user={user} view={safeView} onLogout={handleLogout} onChangeBranch={user.role === "admin" ? changeBranch : undefined} />
+          <Header user={user} view={safeView} onLogout={handleLogout} onChangeBranch={user.role === "admin" || user.role === "warehouse" ? changeBranch : undefined} />
           <main className="flex-1 overflow-hidden">
             {VIEW_COMPONENTS[safeView]}
           </main>
