@@ -1455,7 +1455,10 @@ const POSView = ({ user }: { user: User }) => {
         </div>
 
         {/* Cart panel */}
-        <div className={`flex flex-col lg:w-80 xl:w-96 bg-card border-l border-border overflow-hidden ${tab === "cart" ? "flex flex-1" : "hidden lg:flex"}`}>
+        {/* lg:flex-none/flex-shrink-0: `tab` only matters on mobile — adding a product switches it to
+            "cart", and without these the mobile-only flex-1 would also stretch the cart to half the
+            screen on desktop (squeezing the product grid) until the tab changed back. */}
+        <div className={`flex flex-col lg:w-80 xl:w-96 lg:flex-shrink-0 bg-card border-l border-border overflow-hidden ${tab === "cart" ? "flex flex-1 lg:flex-none" : "hidden lg:flex"}`}>
           <div className="px-4 py-3 border-b border-border flex items-center justify-between flex-shrink-0">
             <div className="flex items-center gap-2">
               <ShoppingCart size={16} className="text-primary" />
