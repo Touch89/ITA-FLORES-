@@ -185,7 +185,7 @@ interface AppState {
 
 const CATEGORIES = [
   "Camisetas","Pantalones","Vestidos","Blusas","Faldas","Chaquetas",
-  "Abrigos","Ropa Interior","Deportiva","Relojes","Joyería","Bolsos",
+  "Abrigos","Ropa Interior","Deportiva","Calzado","Relojes","Joyería","Bolsos",
   "Cinturones","Accesorios",
 ];
 const GENDERS: { value: Gender; label: string }[] = [
