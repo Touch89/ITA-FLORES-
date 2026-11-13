@@ -9,8 +9,10 @@ import {
   Filter, SlidersHorizontal, AlertCircle, Store, Calendar,
   TrendingUp, Boxes, RotateCcw, Printer, UserCog, ShieldCheck,
   Warehouse, ChevronUp, Circle, Barcode, ImageIcon, ArrowLeftRight, Combine, Percent, Loader2,
+  FileSpreadsheet,
 } from "lucide-react";
 import { Toaster, toast } from "sonner";
+import type { SheetData } from "write-excel-file/browser";
 
 // ─── TYPES ───────────────────────────────────────────────────────────────────
 
@@ -1783,6 +1785,205 @@ const POSView = ({ user }: { user: User }) => {
 
 // ─── INVENTORY VIEW (products + stock unified) ────────────────────────────────
 
+// Downloads the whole catalog's stock (every product, ignoring the view's search/category/branch
+// filters) as a real .xlsx: an "Inventario" sheet with one row per product × variant × talla and
+// one stock column per branch in `state.branches`, plus a "Resumen por sucursal" sheet. Branch
+// totals are summed over `state.branches` only (not every `stockByBranch` key) so they always
+// match the columns shown. write-excel-file is imported lazily so it isn't in the initial bundle.
+const exportInventoryXlsx = async (state: AppState) => {
+  const { default: writeXlsxFile } = await import("write-excel-file/browser");
+  const branches = state.branches;
+  const money = "$#,##0.00";
+  const header = (value: string) => ({ value, fontWeight: "bold" as const, backgroundColor: "#F3E8EC" });
+  const bold = (value: string | number) => ({ value, fontWeight: "bold" as const });
+
+  const rows: SheetData = [[
+    "SKU", "Código de barras", "Producto", "Categoría", "Género", "Color", "Modelo", "Talla", "Precio",
+    ...branches, "Total piezas", "Valor total", "Estado",
+  ].map(header)];
+  const branchPieces = branches.map(() => 0);
+  const branchValue = branches.map(() => 0);
+  const branchProducts = branches.map(() => new Set<string>());
+
+  const products = [...state.products].sort((a, b) => a.category.localeCompare(b.category) || a.name.localeCompare(b.name));
+  for (const p of products) {
+    const base = [p.sku, p.barcode, p.name, p.category, gLabel(p.gender)];
+    const status = p.active ? "Activo" : "Inactivo";
+    const lines = p.variants.flatMap((v) => v.sizes.map((sz) => ({ v, sz })));
+    // A product with no variants/tallas yet still gets a row, so the file lists the full catalog.
+    if (lines.length === 0) {
+      rows.push([...base, "", "", "", { value: p.price, format: money }, ...branches.map(() => 0), 0, { value: 0, format: money }, status]);
+      continue;
+    }
+    for (const { v, sz } of lines) {
+      const perBranch = branches.map((b) => sizeStockAt(sz, b));
+      const pieces = perBranch.reduce((a, n) => a + n, 0);
+      perBranch.forEach((n, i) => {
+        branchPieces[i] += n;
+        branchValue[i] += n * p.price;
+        if (n > 0) branchProducts[i].add(p.id);
+      });
+      rows.push([...base, v.color, v.model, sz.size, { value: p.price, format: money }, ...perBranch, pieces, { value: pieces * p.price, format: money }, status]);
+    }
+  }
+  const totalPieces = branchPieces.reduce((a, n) => a + n, 0);
+  const totalValue = branchValue.reduce((a, n) => a + n, 0);
+  rows.push([
+    bold("TOTAL"), null, null, null, null, null, null, null, null,
+    ...branchPieces.map(bold),
+    bold(totalPieces), { ...bold(totalValue), format: money }, null,
+  ]);
+
+  const summary: SheetData = [
+    ["Sucursal", "Piezas", "Valor del inventario", "Productos con existencia"].map(header),
+    ...branches.map((b, i) => [b, branchPieces[i], { value: branchValue[i], format: money }, branchProducts[i].size]),
+    [bold("TOTAL"), bold(totalPieces), { ...bold(totalValue), format: money }, null],
+  ];
+
+  const d = new Date();
+  const stamp = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  await writeXlsxFile([
+    {
+      sheet: "Inventario",
+      data: rows,
+      stickyRowsCount: 1,
+      columns: [{ width: 12 }, { width: 16 }, { width: 30 }, { width: 14 }, { width: 11 }, { width: 14 }, { width: 18 }, { width: 8 }, { width: 12 },
+        ...branches.map(() => ({ width: 14 })), { width: 13 }, { width: 14 }, { width: 10 }],
+    },
+    {
+      sheet: "Resumen por sucursal",
+      data: summary,
+      stickyRowsCount: 1,
+      columns: [{ width: 22 }, { width: 10 }, { width: 22 }, { width: 24 }],
+    },
+  ]).toFile(`inventario-ita-flores-${stamp}.xlsx`);
+};
+
+// Printable inventory as a downloaded PDF. `scope` is "all" (every branch side by side, one column
+// per branch in `state.branches`) or a single branch name. Products are grouped: a shaded row per
+// product with its subtotals, then one row per variant × talla. Rows with no stock in the chosen
+// scope are skipped unless `includeEmpty`. Like the Excel export it ignores the view's filters and
+// jspdf/jspdf-autotable are imported lazily. jsPDF's built-in Helvetica uses WinAnsi encoding, so
+// Spanish accents and ñ render fine without embedding a font.
+const exportInventoryPdf = async (state: AppState, scope: string, includeEmpty: boolean) => {
+  const [{ jsPDF }, { autoTable }] = await Promise.all([import("jspdf"), import("jspdf-autotable")]);
+  type Row = import("jspdf-autotable").RowInput;
+  const isAll = scope === "all";
+  const branches = isAll ? state.branches : [scope];
+  const doc = new jsPDF({ orientation: isAll && branches.length > 3 ? "landscape" : "portrait", unit: "pt", format: "letter" });
+  const pageW = doc.internal.pageSize.getWidth();
+  const margin = 36;
+  const mxn = (n: number) => n.toLocaleString("es-MX", { style: "currency", currency: "MXN" });
+  const pcs = (n: number) => n.toLocaleString("es-MX");
+  const productFill: [number, number, number] = [243, 232, 236];
+  const darkFill: [number, number, number] = [58, 42, 48];
+
+  const body: Row[] = [];
+  const branchPieces = branches.map(() => 0);
+  let totalValue = 0;
+  let productCount = 0;
+
+  const byText = (a: string, b: string) => a.localeCompare(b, "es", { numeric: true, sensitivity: "base" });
+  const products = [...state.products].sort((a, b) => byText(a.category, b.category) || byText(a.name, b.name));
+  for (const p of products) {
+    const lines = p.variants
+      .flatMap((v) => v.sizes.map((sz) => ({ v, sz, perBranch: branches.map((b) => sizeStockAt(sz, b)) })))
+      .map((l) => ({ ...l, pieces: l.perBranch.reduce((a, n) => a + n, 0) }))
+      .filter((l) => includeEmpty || l.pieces > 0);
+    if (lines.length === 0 && !includeEmpty) continue;
+    productCount++;
+    const sub = branches.map((_, i) => lines.reduce((a, l) => a + l.perBranch[i], 0));
+    const subPieces = sub.reduce((a, n) => a + n, 0);
+    sub.forEach((n, i) => { branchPieces[i] += n; });
+    totalValue += subPieces * p.price;
+    const title = `${p.name}${p.active ? "" : " (inactivo)"}\n${p.sku} · ${p.category} · ${gLabel(p.gender)} · ${mxn(p.price)}`;
+    const pStyle = { fillColor: productFill, fontStyle: "bold" as const };
+    if (isAll) {
+      body.push([{ content: title, colSpan: 3, styles: pStyle }, ...sub.map((n) => ({ content: pcs(n), styles: pStyle })), { content: pcs(subPieces), styles: pStyle }]);
+      for (const l of lines) body.push([l.v.color, l.v.model, l.sz.size, ...l.perBranch.map(pcs), pcs(l.pieces)]);
+    } else {
+      body.push([{ content: title, colSpan: 4, styles: pStyle }, { content: pcs(subPieces), styles: pStyle }, { content: mxn(subPieces * p.price), styles: pStyle }]);
+      for (const l of lines) body.push([l.v.color, l.v.model, l.sz.size, mxn(p.price), pcs(l.pieces), mxn(l.pieces * p.price)]);
+    }
+  }
+  const totalPieces = branchPieces.reduce((a, n) => a + n, 0);
+
+  const head: Row[] = isAll
+    ? [["Color", "Modelo", "Talla", ...branches, "Total"]]
+    : [["Color", "Modelo", "Talla", "Precio", "Piezas", "Valor"]];
+  const foot: Row[] = isAll
+    ? [[{ content: "TOTAL", colSpan: 3 }, ...branchPieces.map(pcs), pcs(totalPieces)]]
+    : [[{ content: "TOTAL", colSpan: 4 }, pcs(totalPieces), mxn(totalValue)]];
+  // Columns from index 3 on (Color, Modelo, Talla come first) are numeric → right-aligned.
+  const firstNum = 3;
+  const numCols = isAll ? branches.length + 1 : 3;
+  const columnStyles: Record<number, { halign: "right" }> = {};
+  for (let i = firstNum; i < firstNum + numCols; i++) columnStyles[i] = { halign: "right" };
+
+  const now = new Date();
+  const dateLabel = now.toLocaleString("es-MX", { dateStyle: "long", timeStyle: "short" });
+  const heading = isAll ? "Inventario total" : `Inventario — ${scope}`;
+  const subheading = isAll ? `Todas las sucursales (${branches.length})` : "Sucursal";
+  const drawHeader = () => {
+    doc.setFont("helvetica", "bold"); doc.setFontSize(15); doc.setTextColor(30, 30, 30);
+    doc.text("Ita Flores", margin, 40);
+    doc.setFontSize(12);
+    doc.text(heading, pageW - margin, 40, { align: "right" });
+    doc.setFont("helvetica", "normal"); doc.setFontSize(9); doc.setTextColor(110, 110, 110);
+    doc.text(subheading, pageW - margin, 54, { align: "right" });
+    doc.text(dateLabel, margin, 54);
+  };
+
+  autoTable(doc, {
+    head, body, foot,
+    showFoot: "lastPage",
+    startY: 96,
+    margin: { top: 70, left: margin, right: margin, bottom: 40 },
+    styles: { fontSize: 8, cellPadding: 4, lineColor: [225, 225, 225], lineWidth: 0.5, textColor: [30, 30, 30], valign: "middle" },
+    headStyles: { fillColor: darkFill, textColor: 255, fontStyle: "bold" },
+    footStyles: { fillColor: darkFill, textColor: 255, fontStyle: "bold" },
+    columnStyles,
+    rowPageBreak: "avoid",
+    didParseCell: (data) => {
+      // Right-align the numeric columns in the header/footer too.
+      if ((data.section === "head" || data.section === "foot") && data.column.index >= firstNum) data.cell.styles.halign = "right";
+    },
+    didDrawPage: drawHeader,
+  });
+
+  // Summary under the table (first page if it fits, otherwise a new page).
+  const lastY = (doc as unknown as { lastAutoTable: { finalY: number } }).lastAutoTable.finalY;
+  const summaryHead: Row[] = [["Sucursal", "Piezas"]];
+  const summaryBody: Row[] = isAll
+    ? branches.map((b, i) => [b, pcs(branchPieces[i])])
+    : [[scope, pcs(totalPieces)]];
+  autoTable(doc, {
+    head: summaryHead,
+    body: [...summaryBody, [{ content: "Productos listados", styles: { fontStyle: "bold" } }, pcs(productCount)], [{ content: "Valor del inventario", styles: { fontStyle: "bold" } }, mxn(totalValue)]],
+    startY: lastY + 18,
+    margin: { top: 70, left: margin, right: margin, bottom: 40 },
+    tableWidth: 260,
+    styles: { fontSize: 9, cellPadding: 4, lineColor: [225, 225, 225], lineWidth: 0.5, textColor: [30, 30, 30] },
+    headStyles: { fillColor: darkFill, textColor: 255, fontStyle: "bold" },
+    columnStyles: { 1: { halign: "right" } },
+    didParseCell: (data) => { if (data.section === "head" && data.column.index === 1) data.cell.styles.halign = "right"; },
+    rowPageBreak: "avoid",
+    didDrawPage: drawHeader,
+  });
+
+  const pages = doc.getNumberOfPages();
+  const pageH = doc.internal.pageSize.getHeight();
+  for (let i = 1; i <= pages; i++) {
+    doc.setPage(i);
+    doc.setFont("helvetica", "normal"); doc.setFontSize(8); doc.setTextColor(140, 140, 140);
+    doc.text(`Página ${i} de ${pages}`, pageW - margin, pageH - 20, { align: "right" });
+  }
+
+  const stamp = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+  const slug = isAll ? "total" : scope.normalize("NFD").replace(/[̀-ͯ]/g, "").replace(/[^a-zA-Z0-9]+/g, "-").replace(/^-|-$/g, "").toLowerCase() || "sucursal";
+  doc.save(`inventario-${slug}-${stamp}.pdf`);
+};
+
 const blankProduct = (): Omit<Product,"id"|"sku"|"barcode"|"createdAt"> => ({
   name:"", description:"", category:CATEGORIES[0], gender:"men", price:0, sizeSystem:"sml", variants:[], images:[], active:true,
 });
@@ -1812,6 +2013,44 @@ const InventoryView = ({ user }: { user: User }) => {
   const [vColorHex, setVColorHex] = useState("#888888");
   const [vModel, setVModel] = useState("");
   const [expandedVariantId, setExpandedVariantId] = useState<string | null>(null);
+
+  const [exporting, setExporting] = useState(false);
+  const exportExcel = async () => {
+    setExporting(true);
+    try {
+      await exportInventoryXlsx(state);
+    } catch (err) {
+      console.error("[inventory export]", err);
+      toast.error("No se pudo generar el archivo de Excel");
+    } finally {
+      setExporting(false);
+    }
+  };
+
+  // PDF export modal: "all" = inventario total, otherwise a branch name
+  const [pdfOpen, setPdfOpen] = useState(false);
+  const [pdfScope, setPdfScope] = useState<string>("all");
+  const [pdfIncludeEmpty, setPdfIncludeEmpty] = useState(false);
+  const [pdfBusy, setPdfBusy] = useState(false);
+  const openPdf = () => {
+    // Start from the branch the user is looking at, if it still exists.
+    setPdfScope(filterBranch !== "all" && state.branches.includes(filterBranch) ? filterBranch : "all");
+    setPdfOpen(true);
+  };
+  const downloadPdf = async () => {
+    setPdfBusy(true);
+    try {
+      await exportInventoryPdf(state, pdfScope, pdfIncludeEmpty);
+      setPdfOpen(false);
+    } catch (err) {
+      console.error("[inventory pdf]", err);
+      toast.error("No se pudo generar el PDF");
+    } finally {
+      setPdfBusy(false);
+    }
+  };
+  const piecesAt = (branch: string) =>
+    state.products.reduce((a, p) => a + p.variants.reduce((b, v) => b + v.sizes.reduce((c, sz) => c + sizeStockAt(sz, branch), 0), 0), 0);
 
   // Barcode modal
   const [barcodeProduct, setBarcodeProduct] = useState<Product | null>(null);
@@ -2053,6 +2292,14 @@ const InventoryView = ({ user }: { user: User }) => {
         <div className="flex items-center gap-2">
           <Input value={search} onChange={setSearch} placeholder="Buscar producto, SKU o código de barras…"
             icon={<Search size={15} />} className="flex-1" />
+          <Btn onClick={exportExcel} disabled={exporting} variant="secondary" size="md">
+            {exporting ? <Loader2 size={15} className="animate-spin" /> : <FileSpreadsheet size={15} />}
+            <span className="hidden sm:inline">Excel</span>
+          </Btn>
+          <Btn onClick={openPdf} variant="secondary" size="md">
+            <Printer size={15} />
+            <span className="hidden sm:inline">PDF</span>
+          </Btn>
           {canEdit && <Btn onClick={openNew} size="md"><Plus size={15} /> Nuevo</Btn>}
         </div>
         <div className="flex gap-2 overflow-x-auto pb-1 no-scrollbar">
@@ -2448,6 +2695,44 @@ const InventoryView = ({ user }: { user: User }) => {
             </div>
           </div>
         )}
+      </Modal>
+
+      {/* Inventory PDF modal */}
+      <Modal open={pdfOpen} onClose={() => !pdfBusy && setPdfOpen(false)} title="Imprimir inventario">
+        <div className="p-5 flex flex-col gap-4">
+          <p className="text-sm text-muted-foreground">Elige qué inventario quieres descargar en PDF.</p>
+          <div className="flex flex-col gap-2">
+            {[
+              { value: "all", label: "Inventario total", desc: "Por producto, cuántas piezas hay en cada sucursal con sus variantes", icon: Boxes, pieces: state.branches.reduce((a, b) => a + piecesAt(b), 0) },
+              ...state.branches.map((b) => ({ value: b, label: b, desc: "Inventario de esta sucursal", icon: Store, pieces: piecesAt(b) })),
+            ].map((o) => {
+              const selected = pdfScope === o.value;
+              const Icon = o.icon;
+              return (
+                <button key={o.value} type="button" onClick={() => setPdfScope(o.value)}
+                  className={`flex items-center gap-3 text-left px-4 py-3 rounded-xl border transition-colors ${selected ? "border-primary bg-primary/10" : "border-border bg-secondary hover:bg-accent"}`}>
+                  <Icon size={18} className={selected ? "text-primary" : "text-muted-foreground"} />
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-semibold text-foreground truncate">{o.label}</p>
+                    <p className="text-xs text-muted-foreground">{o.desc}</p>
+                  </div>
+                  <span className="text-xs text-muted-foreground whitespace-nowrap">{o.pieces.toLocaleString("es-MX")} pzs</span>
+                  {selected ? <Check size={16} className="text-primary" /> : <Circle size={16} className="text-muted-foreground/40" />}
+                </button>
+              );
+            })}
+          </div>
+          <label className="flex items-center gap-2 text-sm text-foreground cursor-pointer select-none">
+            <input type="checkbox" checked={pdfIncludeEmpty} onChange={(e) => setPdfIncludeEmpty(e.target.checked)} className="accent-primary w-4 h-4" />
+            Incluir productos y tallas sin existencia
+          </label>
+          <div className="flex gap-3">
+            <Btn onClick={() => setPdfOpen(false)} disabled={pdfBusy} variant="secondary" className="flex-1">Cancelar</Btn>
+            <Btn onClick={downloadPdf} disabled={pdfBusy} className="flex-1">
+              {pdfBusy ? <Loader2 size={15} className="animate-spin" /> : <Printer size={15} />} Descargar PDF
+            </Btn>
+          </div>
+        </div>
       </Modal>
 
       {/* Barcode modal */}
